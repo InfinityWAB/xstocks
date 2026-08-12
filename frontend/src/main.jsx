@@ -800,6 +800,18 @@ function ProductsTab({ app, api, onNavigate }) {
     )
   }, [products, selected, stockByProduct])
 
+  // Nombre d'éléments sélectionnés dans chaque état — la barre d'actions
+  // groupées s'y adapte au lieu de proposer systématiquement « Désactiver ».
+  const selectionCounts = useMemo(() => {
+    let active = 0, inactive = 0
+    for (const id of selected) {
+      const p = products.find(x => x.id === id)
+      if (!p) continue
+      if (p.isActive) active++; else inactive++
+    }
+    return { active, inactive }
+  }, [selected, products])
+
   const handleBulkDeactivate = useCallback(async () => {
     const ids = Array.from(selected).filter(id => products.find(p => p.id === id)?.isActive)
     if (!ids.length) return
@@ -809,6 +821,22 @@ function ProductsTab({ app, api, onNavigate }) {
       await load()
       app.notify(`${ids.length} produit(s) désactivé(s)`, 'success')
     } catch (e) { app.notify(e?.message ?? 'Erreur lors de la désactivation groupée', 'error') }
+  }, [selected, products, load, clearSelection])
+
+  // Pendant de handleBulkDeactivate. Son absence rendait la désactivation
+  // groupée IRRÉVERSIBLE en masse : on pouvait désactiver tout un catalogue
+  // d'un clic et devoir le réactiver article par article.
+  // Il n'existe pas d'endpoint /activate ; la réactivation passe par un PATCH
+  // `isActive: true`, comme le fait déjà l'action unitaire.
+  const handleBulkReactivate = useCallback(async () => {
+    const ids = Array.from(selected).filter(id => products.find(p => p.id === id)?.isActive === false)
+    if (!ids.length) return
+    try {
+      await Promise.all(ids.map(id => api.products.update(id, { isActive: true })))
+      clearSelection()
+      await load()
+      app.notify(`${ids.length} produit(s) réactivé(s)`, 'success')
+    } catch (e) { app.notify(e?.message ?? 'Erreur lors de la réactivation groupée', 'error') }
   }, [selected, products, load, clearSelection])
 
   const filtered = useMemo(() => {
@@ -987,7 +1015,7 @@ function ProductsTab({ app, api, onNavigate }) {
                 }),
               }),
             ),
-            [['Produit', 'name'], ['Catégorie', 'categoryId'], ['ID & création', null], ['Stock', 'stock'], ['Prix de vente', 'salePrice'], ['Statut', 'isActive'], [null, null]].map(([h, key]) =>
+            [['Produit', 'name'], ['Catégorie', 'categoryId'], ['Code', 'code'], ['Créé le', 'createdAt'], ['Stock', 'stock'], ['Prix de vente', 'salePrice'], ['Statut', 'isActive'], ['Action', null]].map(([h, key]) =>
               React.createElement('th', {
                 key: h ?? 'actions', className: key ? 'xstock-sortable-th' : undefined,
                 style: { ...S.th, cursor: key ? 'pointer' : 'default', userSelect: 'none' },
@@ -1019,8 +1047,11 @@ function ProductsTab({ app, api, onNavigate }) {
                       })))
             : sorted.map((p) =>
                 React.createElement('tr', {
-                  key: p.id, style: { cursor: 'pointer', background: selected.has(p.id) ? 'var(--color-primary-muted)' : undefined },
-                  onClick: () => { setEdit(p); setFormOpen(true) },
+                  // Le clic sur la ligne ouvrait l'édition — jugé « pas
+                  // nécessaire et perturbant » en test. Dans un outil de
+                  // saisie on clique pour sélectionner ; l'édition reste
+                  // accessible par le menu d'action, explicite.
+                  key: p.id, style: { background: selected.has(p.id) ? 'var(--color-primary-muted)' : undefined },
                 },
                   React.createElement('td', { style: S.td, onClick: e => e.stopPropagation() },
                     React.createElement('input', { type: 'checkbox', checked: selected.has(p.id), onChange: () => toggleSelect(p.id) }),
@@ -1038,11 +1069,15 @@ function ProductsTab({ app, api, onNavigate }) {
                     ),
                   ),
                   React.createElement('td', { style: S.td }, React.createElement(CategoryTag, { label: p.categoryId })),
+                  // « ID & création » réunissait deux informations sans
+                  // rapport, et affichait l'identifiant technique préfixé d'un
+                  // « # ». Le code produit est une donnée métier : il se lit et
+                  // se recherche, il mérite sa colonne.
                   React.createElement('td', { style: S.td },
-                    React.createElement('div', { style: { fontFamily: 'monospace', fontSize: 12, fontWeight: 600 } }, `#${p.code}`),
-                    React.createElement('div', { style: { fontSize: 11, color: 'var(--color-text-tertiary)' } },
-                      p.createdAt ? new Date(p.createdAt).toLocaleDateString('fr-FR') : '—'),
+                    React.createElement('span', { style: { fontFamily: 'monospace', fontSize: 12, fontWeight: 700 } }, p.code || '—'),
                   ),
+                  React.createElement('td', { style: { ...S.td, fontSize: 12, color: 'var(--color-text-tertiary)' } },
+                    p.createdAt ? new Date(p.createdAt).toLocaleDateString('fr-FR') : '—'),
                   React.createElement('td', { style: S.td }, React.createElement(StockBar, { quantity: stockByProduct.get(p.id) ?? 0, minThreshold: p.minThreshold ?? 0 })),
                   React.createElement('td', { style: S.td },
                     React.createElement('div', { style: { fontFamily: 'monospace', fontWeight: 600 } }, p.salePrice != null ? p.salePrice.toLocaleString('fr-FR') : '—'),
@@ -1080,10 +1115,20 @@ function ProductsTab({ app, api, onNavigate }) {
           style: { ...S.btnSecondary, padding: '6px 12px', fontSize: 12, background: 'transparent', color: 'inherit', border: '1px solid color-mix(in srgb, var(--color-bg) 30%, transparent)' },
           onClick: handleBulkExport,
         }, React.createElement(Icon.download, { size: 13 }), ' Exporter'),
-        React.createElement('button', {
+        // Les deux actions n'apparaissent que si la sélection les concerne :
+        // proposer « Désactiver » sur des produits déjà inactifs n'a pas de
+        // sens, et l'absence de « Réactiver » rendait la désactivation
+        // groupée irréversible (AUDIT-RETOURS-TERRAIN.md, P1.5).
+        selectionCounts.inactive > 0 && React.createElement('button', {
+          style: { ...S.btnSecondary, padding: '6px 12px', fontSize: 12, background: 'transparent', color: 'inherit', border: '1px solid color-mix(in srgb, var(--color-bg) 30%, transparent)' },
+          onClick: handleBulkReactivate,
+          title: `Réactiver ${selectionCounts.inactive} produit(s)`,
+        }, React.createElement(Icon.trending, { size: 13 }), ` Réactiver (${selectionCounts.inactive})`),
+        selectionCounts.active > 0 && React.createElement('button', {
           style: { ...S.btnSecondary, padding: '6px 12px', fontSize: 12, background: 'transparent', color: 'var(--color-danger)', border: '1px solid color-mix(in srgb, var(--color-bg) 30%, transparent)' },
           onClick: handleBulkDeactivate,
-        }, React.createElement(Icon.trash, { size: 13 }), ' Désactiver'),
+          title: `Désactiver ${selectionCounts.active} produit(s)`,
+        }, React.createElement(Icon.trash, { size: 13 }), ` Désactiver (${selectionCounts.active})`),
         React.createElement('button', {
           style: { ...S.btnIcon, color: 'inherit' }, title: 'Désélectionner', onClick: clearSelection,
         }, React.createElement(Icon.x, { size: 14 })),
