@@ -99,3 +99,23 @@ l'exécution** — l'ajouter au préfixe dans `vite.config.js` avant de l'utilis
 `rollupOptions.external` est vide alors que le contrat du shell demande
 d'externaliser `react`, `react-dom` et `@faso-erp/plugin-sdk` ; le préfixe
 maison en tient lieu. À reprendre le jour où le module consommera le SDK.
+
+## Branches
+
+| Branche | Contenu |
+|---|---|
+| `main` | source complète du module — backend à la racine, frontend ici |
+| `prod-frontend` | **ce dossier seul, à la racine** — artefact déployable client |
+
+`prod-frontend` est une **projection** de `main`, régénérée par promotion. La
+circulation est à sens unique :
+
+```
+main ──────────► prod-frontend    promotion
+main ◄────────── prod-frontend    NE JAMAIS FAIRE
+```
+
+Fusionner `prod-frontend` dans `main` y écrase la source complète : le backend
+disparaît et le frontend remonte à la racine. C'est arrivé une fois sur le
+module achats, et il a fallu annuler le merge. Une correction destinée à la
+production se fait sur `main`, puis on régénère `prod-frontend`.
