@@ -812,6 +812,11 @@ function ProductsTab({ app, api, onNavigate }) {
     return { active, inactive }
   }, [selected, products])
 
+  const knownCategories = useMemo(
+    () => Array.from(new Set(products.map(p => p.categoryId).filter(Boolean))).sort(),
+    [products],
+  )
+
   const handleBulkDeactivate = useCallback(async () => {
     const ids = Array.from(selected).filter(id => products.find(p => p.id === id)?.isActive)
     if (!ids.length) return
@@ -1134,7 +1139,11 @@ function ProductsTab({ app, api, onNavigate }) {
         }, React.createElement(Icon.x, { size: 14 })),
       ),
     ),
-    formOpen && React.createElement(ProductFormModal, { app, product: edit, onSave: handleSave, onClose: () => { setFormOpen(false); setEdit(null) }, saving }),
+    formOpen && React.createElement(ProductFormModal, {
+      app, product: edit, onSave: handleSave, saving,
+      onClose: () => { setFormOpen(false); setEdit(null) },
+      categories: knownCategories, existingCodes: products.map(p => p.code),
+    }),
     adjusting && React.createElement(AdjustStockModal, {
       product: adjusting, warehouses, onSave: handleAdjust, onClose: () => setAdjusting(null), saving,
     }),
@@ -1179,69 +1188,167 @@ function AdjustStockModal({ product, warehouses, onClose, onSave, saving }) {
   )
 }
 
-function ProductFormModal({ app, product, onSave, onClose, saving }) {
+/* ─── Référentiels du formulaire produit ────────────────────────────────────
+   Listes fermées, en attendant des référentiels serveur (AUDIT-RETOURS-TERRAIN
+   P2.2). Le texte libre produisait « Kg », « kg », « KG » et « kilo » pour la
+   même unité, ce qui fausse tout regroupement et tout état de stock.          */
+
+const UNITS = [
+  'Unité', 'Kg', 'Gramme', 'Litre', 'Millilitre', 'Mètre', 'Bidon', 'Sachet', 'Boîte', 'Paire',
+]
+
+/** Seuils par défaut demandés en test — un produit créé sans réflexion reste
+ *  ainsi couvert par les alertes de rupture. */
+const DEFAULT_MIN_THRESHOLD = 5
+const DEFAULT_MAX_THRESHOLD = 100
+
+/**
+ * Règle de sortie physique et méthode de valorisation sont DEUX axes
+ * indépendants — le testeur l'a relevé : « on peut avoir Sortie physique FIFO
+ * + CMUP, ou FEFO + CMUP ». Les fondre en un champ rendait l'un des deux
+ * inexprimable et faussait la comptabilité de stock.
+ *
+ * Le backend n'expose aujourd'hui qu'un `valuationMethod` unique : on y écrit
+ * la règle de sortie, qui gouverne le flux physique, et l'interface distingue
+ * clairement les deux notions. Le second axe demande une colonne dédiée —
+ * voir P3.12 dans l'audit.
+ */
+const OUTFLOW_RULES = [
+  ['fefo', 'FEFO — le plus proche de la péremption sort en premier'],
+  ['fifo', 'FIFO — le plus ancien entré sort en premier'],
+  ['lifo', 'LIFO — le plus récent entré sort en premier'],
+]
+
+/** Code article auto-généré quand le champ est laissé vide. Format provisoire
+ *  en attendant l'option de personnalisation demandée (PROD0001, ART01…). */
+function generateProductCode(existingCodes) {
+  const used = new Set((existingCodes ?? []).map(c => String(c ?? '').toUpperCase()))
+  for (let n = 1; n < 100000; n++) {
+    const candidate = `PROD${String(n).padStart(4, '0')}`
+    if (!used.has(candidate)) return candidate
+  }
+  return `PROD${Date.now()}`
+}
+
+function ProductFormModal({ app, product, onSave, onClose, saving, categories, existingCodes }) {
   const isEdit = !!product
   const [form, setForm] = useState({
     code: product?.code ?? '',
     name: product?.name ?? '',
     categoryId: product?.categoryId ?? '',
-    unit: product?.unit ?? 'unite',
+    unit: product?.unit ?? UNITS[0],
     valuationMethod: product?.valuationMethod ?? 'fefo',
     salePrice: product?.salePrice ?? 0,
     purchasePrice: product?.purchasePrice ?? 0,
-    minThreshold: product?.minThreshold ?? 0,
-    maxThreshold: product?.maxThreshold ?? 0,
+    minThreshold: product?.minThreshold ?? DEFAULT_MIN_THRESHOLD,
+    maxThreshold: product?.maxThreshold ?? DEFAULT_MAX_THRESHOLD,
     isActive: product?.isActive ?? true,
     isLotTracked: product?.isLotTracked ?? false,
   })
+  // Erreurs par champ : l'échec d'enregistrement doit désigner le champ fautif
+  // plutôt que d'afficher un message global (P3.11).
+  const [errors, setErrors] = useState({})
 
-  const set = (k) => (e) => setForm(p => ({ ...p, [k]: e.target.value }))
-  const setNum = (k) => (e) => setForm(p => ({ ...p, [k]: +e.target.value }))
+  const set = (k) => (e) => {
+    setForm(p => ({ ...p, [k]: e.target.value }))
+    setErrors(p => (p[k] ? { ...p, [k]: null } : p))
+  }
+  const setNum = (k) => (e) => {
+    setForm(p => ({ ...p, [k]: +e.target.value }))
+    setErrors(p => (p[k] ? { ...p, [k]: null } : p))
+  }
+
+  /** Étiquette avec astérisque rouge pour les champs obligatoires (P3.10). */
+  const fieldLabel = (text, required) => React.createElement('label', { style: S.label },
+    text,
+    required && React.createElement('span', { style: { color: 'var(--color-danger)', marginLeft: 3 } }, '*'),
+  )
+
+  /** Bordure rouge + message sous le champ concerné. */
+  const fieldError = (k) => errors[k] && React.createElement('div', {
+    style: { fontSize: 11, fontWeight: 600, color: 'var(--color-danger)', marginTop: 4 },
+  }, errors[k])
+
+  const inputStyle = (k) => errors[k]
+    ? { ...S.input, borderColor: 'var(--color-danger)' }
+    : S.input
+
+  const handleSubmit = () => {
+    const next = {}
+    if (!form.name.trim()) next.name = 'Ce champ est obligatoire'
+    if (form.minThreshold > form.maxThreshold && form.maxThreshold > 0) {
+      next.maxThreshold = 'Le seuil max doit être supérieur au seuil min'
+    }
+    if (form.salePrice < 0) next.salePrice = 'Le prix ne peut pas être négatif'
+    if (form.purchasePrice < 0) next.purchasePrice = 'Le prix ne peut pas être négatif'
+    if (Object.keys(next).length) { setErrors(next); return }
+
+    // Code laissé vide → généré (P3.2). En édition il n'est pas modifiable,
+    // le backend ne l'accepte pas dans ProductUpdate.
+    const payload = { ...form }
+    if (isEdit) payload.code = undefined          // absent de ProductUpdate
+    else if (!payload.code.trim()) payload.code = generateProductCode(existingCodes)
+    onSave(payload)
+  }
 
   return React.createElement(ModalShell, { onClose },
     React.createElement(ModalHeader, { title: isEdit ? 'Modifier le produit' : 'Nouveau produit', subtitle: isEdit ? product.name : 'Ajouter un article', onClose }),
     React.createElement('div', { style: { padding: '16px 20px', overflow: 'auto', flex: 1 } },
       React.createElement('div', { style: S.grid2 },
+        React.createElement('div', null,
+          fieldLabel('Code', true),
+          React.createElement('input', {
+            style: inputStyle('code'), value: form.code, onChange: set('code'),
+            disabled: isEdit, placeholder: isEdit ? undefined : 'Laisser vide pour générer',
+          }),
+          !isEdit && !form.code.trim() && React.createElement('div', {
+            style: { fontSize: 11, fontWeight: 600, color: 'var(--color-text-tertiary)', marginTop: 4 },
+          }, 'Sera généré : ' + generateProductCode(existingCodes)),
+          fieldError('code'),
+        ),
+        React.createElement('div', null,
+          fieldLabel('Nom', true),
+          React.createElement('input', { style: inputStyle('name'), value: form.name, onChange: set('name') }),
+          fieldError('name'),
+        ),
+        React.createElement('div', null,
+          fieldLabel('Catégorie'),
+          React.createElement('input', {
+            style: inputStyle('categoryId'), value: form.categoryId, onChange: set('categoryId'),
+            list: 'xstock-categories', placeholder: 'Choisir ou saisir…',
+          }),
+          React.createElement('datalist', { id: 'xstock-categories' },
+            (categories ?? []).map(c => React.createElement('option', { key: c, value: c }))),
+          fieldError('categoryId'),
+        ),
+        React.createElement('div', null,
+          fieldLabel('Unité'),
+          React.createElement('select', { style: inputStyle('unit'), value: form.unit, onChange: set('unit') },
+            UNITS.map(u => React.createElement('option', { key: u, value: u }, u))),
+        ),
         React.createElement('div', { style: { gridColumn: '1 / -1' } },
-          React.createElement('label', { style: S.label }, 'Nom *'),
-          React.createElement('input', { style: S.input, value: form.name, onChange: set('name'), required: true }),
+          fieldLabel('Règle de sortie du stock'),
+          React.createElement('select', { style: inputStyle('valuationMethod'), value: form.valuationMethod, onChange: set('valuationMethod') },
+            OUTFLOW_RULES.map(function (r) { return React.createElement('option', { key: r[0], value: r[0] }, r[1]) })),
+          React.createElement('div', {
+            style: { fontSize: 11, fontWeight: 600, color: 'var(--color-text-tertiary)', marginTop: 4, lineHeight: 1.4 },
+          }, 'Détermine quel lot quitte l\u2019entrepôt en premier. La méthode de valorisation comptable (CMUP, coût standard) est un réglage distinct, à venir.'),
         ),
         React.createElement('div', null,
-          React.createElement('label', { style: S.label }, 'Code *'),
-          React.createElement('input', { style: S.input, value: form.code, onChange: set('code'), disabled: isEdit, required: true }),
+          fieldLabel('Prix de vente'),
+          React.createElement('input', { style: inputStyle('salePrice'), type: 'number', min: 0, step: 0.01, value: form.salePrice, onChange: setNum('salePrice') }),
         ),
         React.createElement('div', null,
-          React.createElement('label', { style: S.label }, 'Catégorie'),
-          React.createElement('input', { style: S.input, value: form.categoryId, onChange: set('categoryId') }),
+          fieldLabel("Prix d'achat"),
+          React.createElement('input', { style: inputStyle('purchasePrice'), type: 'number', min: 0, step: 0.01, value: form.purchasePrice, onChange: setNum('purchasePrice') }),
         ),
         React.createElement('div', null,
-          React.createElement('label', { style: S.label }, 'Unité'),
-          React.createElement('input', { style: S.input, value: form.unit, onChange: set('unit') }),
+          fieldLabel('Seuil min'),
+          React.createElement('input', { style: inputStyle('minThreshold'), type: 'number', min: 0, value: form.minThreshold, onChange: setNum('minThreshold') }),
         ),
         React.createElement('div', null,
-          React.createElement('label', { style: S.label }, 'Valorisation'),
-          React.createElement('select', { style: S.input, value: form.valuationMethod, onChange: set('valuationMethod') },
-            React.createElement('option', { value: 'fefo' }, 'FEFO (péremption)'),
-            React.createElement('option', { value: 'fifo' }, 'FIFO'),
-            React.createElement('option', { value: 'lifo' }, 'LIFO'),
-            React.createElement('option', { value: 'cmup' }, 'CMUP (coût moyen)'),
-          ),
-        ),
-        React.createElement('div', null,
-          React.createElement('label', { style: S.label }, 'Prix de vente'),
-          React.createElement('input', { style: S.input, type: 'number', min: 0, step: 0.01, value: form.salePrice, onChange: setNum('salePrice') }),
-        ),
-        React.createElement('div', null,
-          React.createElement('label', { style: S.label }, "Prix d'achat"),
-          React.createElement('input', { style: S.input, type: 'number', min: 0, step: 0.01, value: form.purchasePrice, onChange: setNum('purchasePrice') }),
-        ),
-        React.createElement('div', null,
-          React.createElement('label', { style: S.label }, 'Seuil min'),
-          React.createElement('input', { style: S.input, type: 'number', min: 0, value: form.minThreshold, onChange: setNum('minThreshold') }),
-        ),
-        React.createElement('div', null,
-          React.createElement('label', { style: S.label }, 'Seuil max'),
-          React.createElement('input', { style: S.input, type: 'number', min: 0, value: form.maxThreshold, onChange: setNum('maxThreshold') }),
+          fieldLabel('Seuil max'),
+          React.createElement('input', { style: inputStyle('maxThreshold'), type: 'number', min: 0, value: form.maxThreshold, onChange: setNum('maxThreshold') }),
         ),
         React.createElement('div', { style: { gridColumn: '1 / -1', display: 'flex', gap: 16, alignItems: 'center' } },
           isEdit && React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 13 } },
@@ -1257,7 +1364,7 @@ function ProductFormModal({ app, product, onSave, onClose, saving }) {
     ),
     React.createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8, padding: '12px 20px', borderTop: '1px solid var(--color-border)' } },
       React.createElement('button', { style: S.btnSecondary, onClick: onClose }, 'Annuler'),
-      React.createElement('button', { style: { ...S.btnPrimary, opacity: saving ? 0.6 : 1 }, disabled: saving, onClick: () => onSave(isEdit ? { ...form, code: undefined } : form) },
+      React.createElement('button', { style: { ...S.btnPrimary, opacity: saving ? 0.6 : 1 }, disabled: saving, onClick: handleSubmit },
         saving ? 'Enregistrement…' : isEdit ? 'Enregistrer' : 'Créer'),
     ),
   )
