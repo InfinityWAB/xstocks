@@ -1,0 +1,273 @@
+name: xstock
+version: 0.1.0
+author: xcore-team
+description: >
+  Gestion de stock multi-entrepôts avec intelligence (FEFO/FIFO/LIFO,
+  points de commande, prévisions, classification ABC/XYZ, détection
+  d'anomalies, registre stupéfiants).
+framework_version: '>=2.0'
+execution_mode: trusted
+entry_point: src/main.py
+
+# auth doit être chargé avant : on émet rbac.declare → Orchauth écoute.
+requires:
+  - name: auth
+    version: ">=1.0.0"
+
+env:
+  # Défauts appliqués tant qu'un tenant n'a pas sa propre StockSettings row
+  # (voir StockSettingsService.get_settings — création paresseuse).
+  DEFAULT_LEAD_TIME_DAYS: "7"
+  DEFAULT_SERVICE_LEVEL: "0.95"
+  DEFAULT_EXPIRY_WARNING_DAYS: "30"
+
+# ── IPC exposé (voir src/ipc.py) ────────────────────────────────────────────
+permissions:
+  - resource: "xstock.product.get"
+    actions: ["*"]
+    effect: allow
+  - resource: "xstock.product.list"
+    actions: ["*"]
+    effect: allow
+  - resource: "xstock.warehouse.list"
+    actions: ["*"]
+    effect: allow
+  - resource: "xstock.stock.receive"
+    actions: ["*"]
+    effect: allow
+  - resource: "xstock.stock.issue"
+    actions: ["*"]
+    effect: allow
+  - resource: "xstock.stock.levels"
+    actions: ["*"]
+    effect: allow
+  - resource: "xstock.reorder_point.get"
+    actions: ["*"]
+    effect: allow
+  - resource: "xstock.stockout_risk.list"
+    actions: ["*"]
+    effect: allow
+  # Services partagés consommés
+  - resource: "xauth.*"
+    actions: ["*"]
+    effect: allow
+  - resource: "xpulse.email"
+    actions: ["*"]
+    effect: allow
+  - resource: "xtasks.create"
+    actions: ["*"]
+    effect: allow
+  - resource: "db.*"
+    actions: ["read", "write"]
+    effect: allow
+  - resource: "cache.*"
+    actions: ["read", "write"]
+    effect: allow
+  - resource: "ext.storage.*"
+    actions: ["*"]
+    effect: allow
+
+# ── RBAC : permissions exposées par ce plugin ───────────────────────────────
+# Agrégées par Orchauth via rbac.declare à chaque on_load.
+# Toutes tenant_grantable : un owner peut les déléguer à ses membres.
+rbac:
+  grants:
+    # ── Produits / entrepôts ───────────────────────────────────────────────
+    - name: xstock:products:read
+      description: "Consulter le catalogue produit"
+      tenant_grantable: true
+      group: xstock-catalog
+    - name: xstock:products:write
+      description: "Créer/modifier/désactiver des produits"
+      tenant_grantable: true
+      group: xstock-catalog
+    - name: xstock:warehouses:read
+      description: "Consulter les entrepôts et emplacements"
+      tenant_grantable: true
+      group: xstock-catalog
+    - name: xstock:warehouses:write
+      description: "Créer/modifier des entrepôts et emplacements"
+      tenant_grantable: true
+      group: xstock-catalog
+
+    # ── Mouvements de stock ─────────────────────────────────────────────────
+    - name: xstock:movements:read
+      description: "Consulter les mouvements et niveaux de stock"
+      tenant_grantable: true
+      group: xstock-movements
+    - name: xstock:movements:write
+      description: "Enregistrer réceptions/sorties/transferts"
+      tenant_grantable: true
+      group: xstock-movements
+    - name: xstock:movements:adjust
+      description: "Effectuer des ajustements de stock (correction manuelle)"
+      tenant_grantable: true
+      group: xstock-movements
+
+    # ── Transferts planifiés ──────────────────────────────────────────────────
+    - name: xstock:transfers:read
+      description: "Consulter les documents de transfert planifiés"
+      tenant_grantable: true
+      group: xstock-movements
+    - name: xstock:transfers:write
+      description: "Créer/planifier/exécuter des documents de transfert"
+      tenant_grantable: true
+      group: xstock-movements
+
+    # ── Inventaire ──────────────────────────────────────────────────────────
+    - name: xstock:inventory:read
+      description: "Consulter les comptages d'inventaire"
+      tenant_grantable: true
+      group: xstock-inventory
+    - name: xstock:inventory:write
+      description: "Démarrer/saisir/annuler un comptage"
+      tenant_grantable: true
+      group: xstock-inventory
+    - name: xstock:inventory:validate
+      description: "Clôturer un comptage (y compris override tolérance zéro stupéfiants)"
+      tenant_grantable: false
+      group: xstock-inventory
+
+    # ── Intelligence ────────────────────────────────────────────────────────
+    - name: xstock:intelligence:read
+      description: "Consulter reorder points, prévisions, risques de rupture"
+      tenant_grantable: true
+      group: xstock-intelligence
+    - name: xstock:intelligence:write
+      description: "Déclencher classification et génération de suggestions de transfert"
+      tenant_grantable: true
+      group: xstock-intelligence
+
+    # ── Pièces jointes ──────────────────────────────────────────────────────
+    - name: xstock:attachments:read
+      description: "Télécharger/lister les pièces jointes"
+      tenant_grantable: true
+      group: xstock-attachments
+    - name: xstock:attachments:write
+      description: "Uploader/supprimer des pièces jointes"
+      tenant_grantable: true
+      group: xstock-attachments
+
+    # ── Réglages ────────────────────────────────────────────────────────────
+    - name: xstock:settings:read
+      description: "Consulter les réglages et abonnements d'alerte"
+      tenant_grantable: true
+      group: xstock-settings
+    - name: xstock:settings:write
+      description: "Modifier les réglages et abonnements d'alerte"
+      tenant_grantable: false
+      group: xstock-settings
+
+    # ── Alertes (ciblage via AlertSubscription) ─────────────────────────────
+    - name: xstock:alerts:stock
+      description: "Recevoir les alertes de seuil de stock et de péremption (défaut)"
+      tenant_grantable: true
+      group: xstock-alerts
+    - name: xstock:alerts:controlled-substance
+      description: "Recevoir les alertes stupéfiants (variance, override) (défaut)"
+      tenant_grantable: false
+      group: xstock-alerts
+
+# ── Événements émis ──────────────────────────────────────────────────────────
+events_emitted:
+  xstock.product.created:
+    description: "Produit créé"
+    payload_schema: {tenant_id: string, product_id: string, code: string}
+  xstock.product.updated:
+    description: "Produit modifié"
+    payload_schema: {tenant_id: string, product_id: string, changed_fields: array}
+  xstock.product.deactivated:
+    description: "Produit désactivé"
+    payload_schema: {tenant_id: string, product_id: string}
+  xstock.warehouse.created:
+    description: "Entrepôt créé"
+    payload_schema: {tenant_id: string, warehouse_id: string, code: string, site_id: string}
+
+  xstock.stock_move.recorded:
+    description: "Mouvement de stock enregistré (IN/OUT/TRANSFER/ADJUSTMENT)"
+    payload_schema:
+      tenant_id: string
+      move_id: string
+      product_id: string
+      warehouse_id: string
+      batch_id: string
+      type: string
+      quantity: number
+  xstock.batch.created:
+    description: "Nouveau lot créé lors d'une réception"
+    payload_schema: {tenant_id: string, batch_id: string, product_id: string, batch_number: string, expiry_date: string}
+  xstock.controlled_substance.registered:
+    description: "Sortie de stupéfiant enregistrée au registre — consommé par xaudit"
+    payload_schema:
+      tenant_id: string
+      product_id: string
+      batch_id: string
+      sequence_number: number
+      signatory_id: string
+      witness_id: string
+
+  xstock.inventory_count.started:
+    description: "Comptage d'inventaire démarré"
+    payload_schema: {tenant_id: string, inventory_count_id: string, warehouse_id: string, type: string}
+  xstock.inventory_count.validated:
+    description: "Comptage clôturé"
+    payload_schema: {tenant_id: string, inventory_count_id: string, warehouse_id: string, variance_count: number}
+  xstock.inventory_count.cancelled:
+    description: "Comptage annulé"
+    payload_schema: {tenant_id: string, inventory_count_id: string}
+  xstock.inventory_count.variance_override:
+    description: "Override tolérance zéro sur un écart stupéfiant — audit-sensible"
+    payload_schema:
+      tenant_id: string
+      product_id: string
+      variance: number
+      override_reason: string
+      validated_by: string
+      inventory_count_id: string
+
+  xstock.product.classification_updated:
+    description: "Classification ABC/XYZ recalculée pour un produit"
+    payload_schema: {tenant_id: string, product_id: string, abc_class: string, xyz_class: string}
+  xstock.stock.threshold_alert:
+    description: "Stock sous le seuil min ou au-dessus du seuil max"
+    payload_schema:
+      tenant_id: string
+      product_id: string
+      warehouse_id: string
+      current: number
+      threshold: number
+      direction: string
+  xstock.transfer_suggestion.created:
+    description: "Suggestion de rééquilibrage inter-sites générée"
+    payload_schema:
+      tenant_id: string
+      suggestion_id: string
+      product_id: string
+      source_site_id: string
+      destination_site_id: string
+      quantity: number
+  xstock.batch.expiry_alert:
+    description: "Lot proche de la péremption"
+    payload_schema:
+      tenant_id: string
+      batch_id: string
+      product_id: string
+      expiry_date: string
+      days_remaining: number
+
+# ── Ressources système ────────────────────────────────────────────────────────
+resources:
+  timeout_seconds: 60
+  max_memory_mb: 512
+  rate_limit:
+    calls: 1000
+    period_seconds: 60
+
+runtime:
+  health_check:
+    enabled: true
+    interval_seconds: 30
+    timeout_seconds: 5
+  retry:
+    max_attempts: 3
+    backoff_seconds: 2.0
