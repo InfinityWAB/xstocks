@@ -897,18 +897,37 @@ function ProductsTab({ app, api, onNavigate }) {
     catch (e) { app.notify(e?.message ?? 'Erreur lors de la réactivation', 'error') }
   }, [load])
 
-  const handleSave = useCallback(async (data) => {
+  const handleSave = useCallback(async (data, initialStock) => {
     setSaving(true)
     try {
-      if (edit) await api.products.update(edit.id, data)
-      else await api.products.create(data)
+      if (edit) {
+        await api.products.update(edit.id, data)
+      } else {
+        const created = await api.products.create(data)
+        // La reception est faite APRES la creation, dans un appel distinct :
+        // le produit existe donc meme si le mouvement echoue. On previent
+        // alors sans faire croire que la creation a rate — c'est la fiche
+        // article qui compte, la quantite se rattrape par un ajustement.
+        if (initialStock && created?.id) {
+          try {
+            await api.movements.receive({
+              productId: created.id,
+              warehouseId: initialStock.warehouseId,
+              quantity: initialStock.quantity,
+              reason: 'Stock initial',
+            })
+          } catch (e) {
+            app.notify(`Produit créé, mais le stock initial n'a pas pu être enregistré : ${e?.message ?? 'erreur'}`, 'warning')
+          }
+        }
+      }
       setFormOpen(false)
       setEdit(null)
       await load()
       app.notify(edit ? 'Produit modifié' : 'Produit créé', 'success')
     } catch (e) { app.notify(e?.message ?? 'Erreur enregistrement', 'error') }
     setSaving(false)
-  }, [edit])
+  }, [edit, load])
 
   const handleAdjust = useCallback(async (data) => {
     setSaving(true)
@@ -1142,7 +1161,7 @@ function ProductsTab({ app, api, onNavigate }) {
     formOpen && React.createElement(ProductFormModal, {
       app, product: edit, onSave: handleSave, saving,
       onClose: () => { setFormOpen(false); setEdit(null) },
-      categories: knownCategories, existingCodes: products.map(p => p.code),
+      categories: knownCategories, existingCodes: products.map(p => p.code), warehouses,
     }),
     adjusting && React.createElement(AdjustStockModal, {
       product: adjusting, warehouses, onSave: handleAdjust, onClose: () => setAdjusting(null), saving,
@@ -1230,7 +1249,7 @@ function generateProductCode(existingCodes) {
   return `PROD${Date.now()}`
 }
 
-function ProductFormModal({ app, product, onSave, onClose, saving, categories, existingCodes }) {
+function ProductFormModal({ app, product, onSave, onClose, saving, categories, existingCodes, warehouses }) {
   const isEdit = !!product
   const [form, setForm] = useState({
     code: product?.code ?? '',
@@ -1248,6 +1267,14 @@ function ProductFormModal({ app, product, onSave, onClose, saving, categories, e
   // Erreurs par champ : l'échec d'enregistrement doit désigner le champ fautif
   // plutôt que d'afficher un message global (P3.11).
   const [errors, setErrors] = useState({})
+
+  // Stock initial — un produit n'appartient PAS à un entrepôt : le catalogue
+  // est global au tenant, et les quantités vivent dans les mouvements. Le
+  // champ demandé est donc une réception initiale, déclenchée juste après la
+  // création. Réservé à la création : sur un produit existant, la quantité se
+  // corrige par « Ajuster le stock », qui trace un motif.
+  const [initialWarehouseId, setInitialWarehouseId] = useState('')
+  const [initialQuantity, setInitialQuantity] = useState(0)
 
   const set = (k) => (e) => {
     setForm(p => ({ ...p, [k]: e.target.value }))
@@ -1285,10 +1312,18 @@ function ProductFormModal({ app, product, onSave, onClose, saving, categories, e
 
     // Code laissé vide → généré (P3.2). En édition il n'est pas modifiable,
     // le backend ne l'accepte pas dans ProductUpdate.
+    if (!isEdit && initialQuantity > 0 && !initialWarehouseId) {
+      setErrors({ initialWarehouseId: 'Choisissez un entrepôt pour ce stock initial' })
+      return
+    }
+
     const payload = { ...form }
     if (isEdit) payload.code = undefined          // absent de ProductUpdate
     else if (!payload.code.trim()) payload.code = generateProductCode(existingCodes)
-    onSave(payload)
+
+    onSave(payload, !isEdit && initialQuantity > 0
+      ? { warehouseId: initialWarehouseId, quantity: initialQuantity }
+      : null)
   }
 
   return React.createElement(ModalShell, { onClose },
@@ -1349,6 +1384,32 @@ function ProductFormModal({ app, product, onSave, onClose, saving, categories, e
         React.createElement('div', null,
           fieldLabel('Seuil max'),
           React.createElement('input', { style: inputStyle('maxThreshold'), type: 'number', min: 0, value: form.maxThreshold, onChange: setNum('maxThreshold') }),
+        ),
+        // Stock initial — création uniquement.
+        !isEdit && React.createElement('div', { style: { gridColumn: '1 / -1', borderTop: '1px solid var(--color-border)', paddingTop: 14, marginTop: 4 } },
+          React.createElement('div', { style: { ...S.label, marginBottom: 10 } }, 'Stock initial (optionnel)'),
+          React.createElement('div', { style: S.grid2 },
+            React.createElement('div', null,
+              fieldLabel('Entrepôt'),
+              React.createElement('select', {
+                style: inputStyle('initialWarehouseId'), value: initialWarehouseId,
+                onChange: e => { setInitialWarehouseId(e.target.value); setErrors(p => ({ ...p, initialWarehouseId: null })) },
+              },
+                React.createElement('option', { value: '' }, '— Aucun —'),
+                (warehouses ?? []).map(w => React.createElement('option', { key: w.id, value: w.id }, w.name)),
+              ),
+              fieldError('initialWarehouseId'),
+            ),
+            React.createElement('div', null,
+              fieldLabel('Quantité en stock'),
+              React.createElement('input', {
+                style: S.input, type: 'number', min: 0, value: initialQuantity,
+                onChange: e => setInitialQuantity(+e.target.value),
+              }),
+            ),
+          ),
+          React.createElement('div', { style: { fontSize: 11, fontWeight: 600, color: 'var(--color-text-tertiary)', marginTop: 6, lineHeight: 1.4 } },
+            'Enregistre une réception dès la création. Laissez à zéro pour créer la fiche article sans stock — les quantités se saisissent ensuite par les mouvements.'),
         ),
         React.createElement('div', { style: { gridColumn: '1 / -1', display: 'flex', gap: 16, alignItems: 'center' } },
           isEdit && React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 13 } },
