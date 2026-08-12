@@ -1,4 +1,4 @@
-function definePlugin(factory) { return factory }
+import { definePlugin } from '@infintywab/plugin-sdk'
 
 const BASE = '/app/xstock'
 const modalRoot = document.getElementById('modal-root') || document.body

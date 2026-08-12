@@ -70,6 +70,22 @@ et un log en dur `v0.2.0`. L'identifiant hésite entre `stock` (manifest) et
 
 ---
 
+## SDK
+
+Le module déclare `@infintywab/plugin-sdk` ([`InfinityWAB/ersdk`](https://github.com/InfinityWAB/ersdk)),
+qui porte le contrat entre le shell et les plugins : types de l'`AppAPI`, du
+`Manifest`, constantes (`EVENTS`, `STORE_KEYS`) et helpers.
+
+`definePlugin` en provient désormais, au lieu d'être réimplémenté localement.
+Le SDK n'a aucune dépendance à l'exécution, il est donc simplement inclus dans
+le bundle — la taille de sortie est inchangée.
+
+Toute évolution du contrat passe par une version du SDK : le modifier depuis
+son dépôt, publier (`npm version minor && git push --follow-tags`), puis relever
+la plage ici. Un type absent du paquet signale un trou dans la surface publique
+du SDK — à corriger en amont, jamais en atteignant ses sources par un chemin
+relatif.
+
 ## Runtime
 
 React n'est pas embarqué : il est fourni par le shell via

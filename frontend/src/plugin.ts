@@ -1,4 +1,4 @@
-import { ERPPlugin, type Manifest } from '@faso-erp/plugin-sdk'
+import { ERPPlugin, type Manifest } from '@infintywab/plugin-sdk'
 import { ProductsPage } from './pages/products'
 import { WarehousesPage } from './pages/warehouses'
 import { MovementsPage } from './pages/movements'

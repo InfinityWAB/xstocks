@@ -1,5 +1,5 @@
 {
-  "name": "@faso-erp/plugin-stock",
+  "name": "@infintywab/plugin-stock",
   "version": "0.2.0",
   "private": true,
   "description": "Plugin desktop de gestion de stock pour FasoOrchestra ERP.",
@@ -10,7 +10,8 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "clsx": "^2"
+    "clsx": "^2",
+    "@infintywab/plugin-sdk": "^1.1.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4",
