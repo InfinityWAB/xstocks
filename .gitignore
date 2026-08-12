@@ -21,3 +21,11 @@ rad.json
 *.flf
 #Test results file
 TestResults.xml
+### Node / frontend ###
+node_modules/
+dist/
+
+### Python ###
+__pycache__/
+*.pyc
+.venv/

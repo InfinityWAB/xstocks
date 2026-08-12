@@ -1,0 +1,22 @@
+{
+  "name": "@faso-erp/plugin-stock",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Plugin desktop de gestion de stock pour FasoOrchestra ERP.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite build --watch",
+    "build": "vite build",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "clsx": "^2"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4",
+    "react": "^18",
+    "@types/react": "^18",
+    "typescript": "^5",
+    "vite": "^5"
+  }
+}
