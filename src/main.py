@@ -20,6 +20,7 @@ from xcore.sdk import TrustedBase, get_logger
 
 from .ipc import IPCCommands
 from .models import ModelBase
+from .schema_upgrade import ensure_move_idempotency_schema
 from .routes import (
     build_attachments_router,
     build_intelligence_router,
@@ -101,6 +102,9 @@ class Plugin(IPCCommands, TrustedBase):
     async def _initialize_tables(self) -> None:
         async with self._db.engine.begin() as conn:
             await conn.run_sync(ModelBase.metadata.create_all)
+        # create_all ne touche pas une table existante : ajoute les colonnes
+        # d'idempotence des mouvements sur une base antérieure (no-op sinon).
+        await ensure_move_idempotency_schema(self._db.engine)
         logger.info("[xstock] Tables initialisées")
 
     # ── RBAC ────────────────────────────────────────────────────

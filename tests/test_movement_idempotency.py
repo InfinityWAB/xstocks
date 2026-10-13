@@ -186,3 +186,84 @@ async def test_rejeu_apres_succes_ne_releve_pas_stock_insuffisant(env):
     assert len(again) == 1
     with pytest.raises(InsufficientStockError):
         await svc.issue(product_id="p1", warehouse_id="w1", quantity=4, created_by="u", idempotency_key="autre")
+
+
+@pytest.mark.asyncio
+async def test_rejeu_divergent_quantite_idempotent_mais_signale(env):
+    svc, maker = env
+    first = await svc.receive(product_id="p1", quantity=10, idempotency_key="k", **R)
+    assert first.idempotent_replay is False and first.idempotency_mismatch is None
+    again = await svc.receive(product_id="p1", quantity=99, idempotency_key="k", **R)
+    assert again.id == first.id and again.quantity == 10
+    assert again.idempotent_replay is True and again.idempotency_mismatch == ["quantity"]
+    assert await _qty(maker, "p1") == 10
+    same = await svc.receive(product_id="p1", quantity=10, idempotency_key="k", **R)
+    assert same.idempotent_replay is True and same.idempotency_mismatch is None
+
+
+@pytest.mark.asyncio
+async def test_rejeu_divergent_lot_signale(env):
+    svc, maker = env
+    await svc.receive(product_id="plot", quantity=3, batch_number="A", idempotency_key="k", **R)
+    again = await svc.receive(product_id="plot", quantity=3, batch_number="B", idempotency_key="k", **R)
+    assert again.idempotency_mismatch == ["batch_number"]
+    assert await _count(maker) == 1
+
+
+@pytest.mark.asyncio
+async def test_rejeu_divergent_issue_signale(env):
+    svc, maker = env
+    await svc.receive(product_id="p1", quantity=10, **R)
+    await svc.issue(product_id="p1", warehouse_id="w1", quantity=2, created_by="u", idempotency_key="s")
+    again = await svc.issue(product_id="p1", warehouse_id="w1", quantity=5, created_by="u", idempotency_key="s")
+    assert again[0].idempotency_mismatch == ["quantity"]
+    assert await _qty(maker, "p1") == 8
+
+
+@pytest.mark.asyncio
+async def test_recherche_de_rejeu_utilise_l_index(env):
+    _, maker = env
+    from sqlalchemy import text
+    async with maker() as s:
+        plan = (await s.execute(text(
+            "EXPLAIN QUERY PLAN SELECT * FROM xstock_moves WHERE tenant_id='t1' AND idempotency_key='x' "
+            "ORDER BY idempotency_rank"
+        ))).all()
+    assert any("uq_xstock_move_tenant_idempotency" in str(r) for r in plan), plan
+
+
+@pytest.mark.asyncio
+async def test_mise_a_niveau_base_ancien_schema():
+    from sqlalchemy import inspect, text
+    from src.schema_upgrade import ensure_move_idempotency_schema
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False}
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(ModelBase.metadata.create_all)
+        # Recrée l'ANCIEN schéma : sans colonnes ni index d'idempotence.
+        await conn.execute(text("DROP INDEX uq_xstock_move_tenant_idempotency"))
+        await conn.execute(text("ALTER TABLE xstock_moves DROP COLUMN idempotency_key"))
+        await conn.execute(text("ALTER TABLE xstock_moves DROP COLUMN idempotency_rank"))
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as s, s.begin():
+        s.add_all([Product(id="p1", tenant_id=T, code="P1", name="P1"),
+                   Warehouse(id="w1", tenant_id=T, code="W1", name="W1")])
+
+    first = await ensure_move_idempotency_schema(engine)
+    assert set(first) == {"column:idempotency_key", "column:idempotency_rank",
+                          "index:uq_xstock_move_tenant_idempotency"}
+    async with engine.connect() as conn:
+        cols = await conn.run_sync(lambda c: {x["name"] for x in inspect(c).get_columns("xstock_moves")})
+        idx = await conn.run_sync(lambda c: {x["name"] for x in inspect(c).get_indexes("xstock_moves")})
+    assert {"idempotency_key", "idempotency_rank"} <= cols
+    assert "uq_xstock_move_tenant_idempotency" in idx
+
+    svc = StockMovementService(Db(maker), T)
+    a = await svc.receive(product_id="p1", warehouse_id="w1", quantity=4, created_by="u", idempotency_key="k")
+    b = await svc.receive(product_id="p1", warehouse_id="w1", quantity=4, created_by="u", idempotency_key="k")
+    assert a.id == b.id
+
+    assert await ensure_move_idempotency_schema(engine) == []  # second chargement : no-op
+    await engine.dispose()

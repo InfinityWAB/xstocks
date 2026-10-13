@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from uuid import uuid4
 
 from sqlalchemy import select
+from xcore.sdk import get_logger
 from sqlalchemy.exc import IntegrityError
 
 from ..algorithms.controlled_substances import next_sequence_number
@@ -58,6 +59,8 @@ from .exceptions import (
     WitnessRequiredError,
 )
 from .settings import StockSettingsService
+
+logger = get_logger("xstock.movement")
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -118,8 +121,8 @@ class StockMovementService:
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _slot(key: Optional[str], rank: int) -> Optional[str]:
-        return f"{key}:{rank}" if key else None
+    def _slot(key: Optional[str], rank: int) -> dict:
+        return {"idempotency_key": key, "idempotency_rank": rank} if key else {}
 
     async def _replay(
         self, session: "AsyncSession", key: Optional[str]
@@ -130,11 +133,42 @@ class StockMovementService:
         result = await session.execute(
             select(StockMove).where(
                 StockMove.tenant_id == self.tenant_id,
-                StockMove.idempotency_key.startswith(f"{key}:"),
-            )
+                StockMove.idempotency_key == key,
+            ).order_by(StockMove.idempotency_rank)
         )
-        moves = sorted(result.scalars().all(), key=lambda m: int(m.idempotency_key.rsplit(":", 1)[1]))
+        moves = list(result.scalars().all())
         return await self._move_responses(session, moves) if moves else []
+
+    async def _flag_replay(
+        self, session: "AsyncSession", replayed: list[StockMoveResponse], *,
+        operation: str, quantity: float, batch_number: Optional[str] = None,
+    ) -> list[StockMoveResponse]:
+        """Marque le résultat comme rejeu et signale toute divergence avec la
+        requête rejouée (quantité, lot) — sans jamais lever : l'idempotence prime."""
+        mismatch: list[str] = []
+        if abs(sum(m.quantity for m in replayed) - quantity) > 1e-9:
+            mismatch.append("quantity")
+        if batch_number is not None and replayed[0].batch_id is not None:
+            batch = await BatchRepository(session).get(replayed[0].batch_id, self.tenant_id)
+            if batch is None or batch.batch_number != batch_number:
+                mismatch.append("batch_number")
+        for m in replayed:
+            m.idempotent_replay = True
+            m.idempotency_mismatch = mismatch or None
+        if mismatch:
+            logger.warning(
+                "idempotency replay diverges from original movement",
+                operation=operation,
+                tenant_id=self.tenant_id,
+                product_id=replayed[0].product_id,
+                warehouse_id=replayed[0].warehouse_id,
+                original_move_ids=[m.id for m in replayed],
+                original_quantity=sum(m.quantity for m in replayed),
+                requested_quantity=quantity,
+                requested_batch_number=batch_number,
+                mismatch=mismatch,
+            )
+        return replayed
 
     # ── Receive (IN) ─────────────────────────────────────────
 
@@ -160,7 +194,9 @@ class StockMovementService:
             async with session.begin():
                 replay = await self._replay(session, key)
                 if replay:
-                    return replay[0]
+                    return (await self._flag_replay(
+                        session, replay, operation="receive", quantity=quantity, batch_number=batch_number,
+                    ))[0]
                 try:
                     async with session.begin_nested():
                         return await self._receive_in_tx(
@@ -177,7 +213,9 @@ class StockMovementService:
                     replay = await self._replay(session, key)
                     if not replay:
                         raise
-                    return replay[0]
+                    return (await self._flag_replay(
+                        session, replay, operation="receive", quantity=quantity, batch_number=batch_number,
+                    ))[0]
 
     async def _receive_in_tx(
         self, session: "AsyncSession", key: Optional[str], *, product_id: str, warehouse_id: str,
@@ -230,7 +268,7 @@ class StockMovementService:
             source_reference=source_reference,
             reason=reason,
             move_date=move_date,
-            idempotency_key=self._slot(key, 0),
+            **self._slot(key, 0),
         )
 
         if effective_cost is not None:
@@ -269,7 +307,7 @@ class StockMovementService:
             async with session.begin():
                 replay = await self._replay(session, key)
                 if replay:
-                    return replay
+                    return await self._flag_replay(session, replay, operation="issue", quantity=quantity)
                 try:
                     async with session.begin_nested():
                         return await self._issue_in_tx(
@@ -284,7 +322,7 @@ class StockMovementService:
                     replay = await self._replay(session, key)
                     if not replay:
                         raise
-                    return replay
+                    return await self._flag_replay(session, replay, operation="issue", quantity=quantity)
 
     async def _issue_in_tx(
         self, session: "AsyncSession", key: Optional[str], *, product_id: str, warehouse_id: str,
@@ -338,7 +376,7 @@ class StockMovementService:
                 source_reference=source_reference,
                 reason=reason,
                 move_date=move_date,
-                idempotency_key=self._slot(key, 0),
+                **self._slot(key, 0),
             )
             moves.append(move)
         else:
@@ -372,7 +410,7 @@ class StockMovementService:
                     source_reference=source_reference,
                     reason=reason,
                     move_date=move_date,
-                    idempotency_key=self._slot(key, rank),
+                    **self._slot(key, rank),
                 )
                 moves.append(move)
                 if product.is_controlled_substance:
@@ -766,6 +804,7 @@ class StockMovementService:
         reason: Optional[str] = None,
         move_date: Optional[datetime] = None,
         idempotency_key: Optional[str] = None,
+        idempotency_rank: Optional[int] = None,
     ) -> StockMove:
         move = StockMove(
             tenant_id=self.tenant_id,
@@ -782,6 +821,7 @@ class StockMovementService:
             balance_after=balance_after,
             source_reference=source_reference,
             idempotency_key=idempotency_key,
+            idempotency_rank=idempotency_rank,
             reason=reason,
             created_by=created_by,
             move_date=move_date or datetime.now(timezone.utc),
