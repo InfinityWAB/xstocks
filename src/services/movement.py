@@ -85,7 +85,7 @@ class StockMovementService:
             return
         try:
             access = await self._call_plugin(
-                "xauth", "xauth.tenant_access",
+                "auth", "xauth.tenant_access",
                 {"user_id": witness_id, "tenant_id": self.tenant_id},
             )
         except Exception as exc:

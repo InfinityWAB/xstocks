@@ -73,14 +73,14 @@ class AlertService:
             resolved = []
             for user_id in recipients.user_ids:
                 # Contrairement aux branches role_id/permission (qui partent
-                # de xauth.get_tenant_members, donc déjà scopées), cette
+                # de xauth.users.list.tenant, donc déjà scopées), cette
                 # branche acceptait n'importe quel user_id sans vérifier son
                 # appartenance au tenant courant — canal d'exfiltration vers
                 # un tenant tiers (audit xstock Constat 2). xauth.tenant_access
                 # vérifie l'appartenance directement, un appel IPC par user_id.
                 try:
                     access = await self._call_plugin(
-                        "xauth", "xauth.tenant_access",
+                        "auth", "xauth.tenant_access",
                         {"user_id": user_id, "tenant_id": self.tenant_id},
                     )
                 except Exception as exc:
@@ -93,7 +93,7 @@ class AlertService:
                     )
                     continue
                 try:
-                    result = await self._call_plugin("xauth", "xauth.get_user", {"user_id": user_id})
+                    result = await self._call_plugin("auth", "xauth.get_user", {"user_id": user_id})
                 except Exception as exc:
                     logger.warning("xauth.get_user(%s) failed: %s", user_id, exc)
                     continue
@@ -104,22 +104,35 @@ class AlertService:
 
         try:
             result = await self._call_plugin(
-                "xauth", "xauth.get_tenant_members", {"tenant_id": self.tenant_id}
+                "auth", "xauth.users.list.tenant", {"tenant_id": self.tenant_id}
             )
         except Exception as exc:
-            logger.warning("xauth.get_tenant_members(%s) failed: %s", self.tenant_id, exc)
+            logger.warning("xauth.users.list.tenant(%s) failed: %s", self.tenant_id, exc)
             return []
-        members = (result or {}).get("members", [])
+        members = [
+            {"user_id": u["id"], "email": u.get("email")}
+            for u in (result or {}).get("users", [])
+        ]
 
         if recipients.role_id:
-            return [m for m in members if m.get("role_id") == recipients.role_id]
+            matched = [m for m in members if m.get("role_id") == recipients.role_id]
+            if not matched:
+                # xauth.users.list.tenant n'expose pas role_id : le filtre par
+                # rôle ne peut rien résoudre. Ne pas rester silencieux.
+                logger.warning(
+                    "alert role_id filter resolved no recipient: xauth.users.list.tenant does not expose role_id",
+                    tenant_id=self.tenant_id,
+                    role_id=recipients.role_id,
+                    members=len(members),
+                )
+            return matched
 
         if recipients.permission:
             allowed = []
             for member in members:
                 try:
                     check = await self._call_plugin(
-                        "xauth",
+                        "auth",
                         "xauth.has_permission",
                         {
                             "user_id": member["user_id"],
