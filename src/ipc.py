@@ -8,6 +8,14 @@ Unlike HTTP routes, IPC calls carry no authenticated request context — every
 action takes `tenant_id` explicitly in its payload (never inferred from a
 JWT/header), matching xlicense's `xlicense.get_tenant_licenses` convention.
 
+Contrôle d'accès : chaque action déclare `side_effect` (read|write). Aucune
+n'utilise `permissions=` volontairement : ces actions sont appelées en interne
+(xpos, xpurchase, xassets, xfleet, xprint) via `call_plugin`, qui ne propage un
+principal que si l'appel parent est passé par `supervisor._dispatch`. Les appels
+issus de routes FastAPI de plugin ou de tâches de fond arrivent SANS principal
+et seraient refusés (fail-closed, ActionPermissionMiddleware). Le contrôle
+plugin-à-plugin relève de `allowed_callers` (plugin.yaml, IPCAuthMiddleware).
+
 Covers the two concrete cross-module needs from the spec (§3.4/§7):
   - Achats (future xpurchase): receive stock on PO delivery, read reorder
     points/product catalog to build purchase suggestions.
@@ -41,7 +49,7 @@ from .services.product import ProductService, WarehouseService
 class IPCCommands(AutoDispatchMixin):
     # ── Product / warehouse catalog ─────────────────────────────
 
-    @action("xstock.product.get")
+    @action("xstock.product.get", side_effect="read")
     @schema(
         version="1.0",
         input={"tenant_id": (str, ...), "product_id": (str, ...)},
@@ -56,7 +64,7 @@ class IPCCommands(AutoDispatchMixin):
             return error(str(exc), code="not_found")
         return ok(result={"product": product.model_dump(mode="json")})
 
-    @action("xstock.product.list")
+    @action("xstock.product.list", side_effect="read")
     @schema(
         version="1.0",
         input={
@@ -77,7 +85,7 @@ class IPCCommands(AutoDispatchMixin):
             products = await service.list_products(limit=payload.limit, offset=payload.offset)
         return ok(result={"products": [p.model_dump(mode="json") for p in products]})
 
-    @action("xstock.product.update")
+    @action("xstock.product.update", side_effect="write")
     @schema(
         version="1.0",
         input={
@@ -109,7 +117,7 @@ class IPCCommands(AutoDispatchMixin):
             return error(str(exc), code="not_found")
         return ok(result={"product": product.model_dump(mode="json")})
 
-    @action("xstock.warehouse.list")
+    @action("xstock.warehouse.list", side_effect="read")
     @schema(
         version="1.0",
         input={"tenant_id": (str, ...), "limit": (int, 50), "offset": (int, 0)},
@@ -125,7 +133,7 @@ class IPCCommands(AutoDispatchMixin):
 
     # ── Stock movements ──────────────────────────────────────────
 
-    @action("xstock.stock.receive")
+    @action("xstock.stock.receive", side_effect="write")
     @schema(
         version="1.0",
         input={
@@ -166,7 +174,7 @@ class IPCCommands(AutoDispatchMixin):
             return error(str(exc), code="invalid_request")
         return ok(result={"move": move.model_dump(mode="json")})
 
-    @action("xstock.stock.issue")
+    @action("xstock.stock.issue", side_effect="write")
     @schema(
         version="1.0",
         input={
@@ -211,7 +219,7 @@ class IPCCommands(AutoDispatchMixin):
             return error(str(exc), code="insufficient_stock")
         return ok(result={"moves": [m.model_dump(mode="json") for m in moves]})
 
-    @action("xstock.stock.levels")
+    @action("xstock.stock.levels", side_effect="read")
     @schema(
         version="1.0",
         input={
@@ -235,7 +243,7 @@ class IPCCommands(AutoDispatchMixin):
 
     # ── Intelligence (reporting) ─────────────────────────────────
 
-    @action("xstock.reorder_point.get")
+    @action("xstock.reorder_point.get", side_effect="read")
     @schema(
         version="1.0",
         input={
@@ -268,7 +276,7 @@ class IPCCommands(AutoDispatchMixin):
             return error(str(exc), code="insufficient_history")
         return ok(result=result)
 
-    @action("xstock.stockout_risk.list")
+    @action("xstock.stockout_risk.list", side_effect="read")
     @schema(
         version="1.0",
         input={

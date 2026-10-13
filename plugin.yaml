@@ -5,9 +5,18 @@ description: >
   Gestion de stock multi-entrepôts avec intelligence (FEFO/FIFO/LIFO,
   points de commande, prévisions, classification ABC/XYZ, détection
   d'anomalies, registre stupéfiants).
-framework_version: '>=2.0'
+framework_version: '>=2.9'
 execution_mode: trusted
 entry_point: src/main.py
+# ACL IPC plugin-à-plugin (IPCAuthMiddleware, enforce_ipc=true) : seuls ces plugins
+# peuvent appeler celui-ci via call_plugin. Absent ou [] = tout refuser.
+allowed_callers:
+  - xpos
+  - xsales
+  - xpurchase
+  - xassets
+  - xfleet
+  - xreporting
 
 # auth doit être chargé avant : on émet rbac.declare → Orchauth écoute.
 requires:
