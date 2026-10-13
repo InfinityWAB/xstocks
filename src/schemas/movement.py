@@ -95,6 +95,12 @@ class StockMoveResponse(BaseModel):
     created_by: str
     move_date: datetime
 
+    # Renseignés uniquement quand l'appel est un rejeu idempotent : le résultat est
+    # celui du premier appel; idempotency_mismatch liste les champs divergents
+    # (quantity, batch_number) entre la requête rejouée et le mouvement d'origine.
+    idempotent_replay: bool = False
+    idempotency_mismatch: Optional[list[str]] = None
+
 
 # ---------------------------------------------------------------------------
 # Movement operation requests — one per StockMovementService method.

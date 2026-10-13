@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Optional
 
-from sqlalchemy import Date, DateTime, Enum as SqlEnum, Float, ForeignKey, Index, String
+from sqlalchemy import Date, DateTime, Enum as SqlEnum, Float, ForeignKey, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import ModelBase, TenantMixin
@@ -70,6 +70,14 @@ class StockMove(TenantMixin, ModelBase):
     source_reference: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # required if type=adjustment
 
+    # Idempotence : idempotency_key = sha256(type|produit|entrepôt|clé appelant)
+    # (identique pour tous les mouvements d'un même appel), idempotency_rank = rang
+    # du mouvement dans l'appel (issue multi-lots => plusieurs mouvements).
+    # NULL sans idempotency_key fournie par l'appelant (comportement historique).
+    # Recherche par égalité sur le préfixe de l'index unique ci-dessous.
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    idempotency_rank: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
     # Costing — populated by the valuation engine (algorithms/valuation.py) on
     # IN (declared/purchase cost) and OUT (FIFO/LIFO/CMUP-consumed cost).
     # Null when no cost is known (e.g. ADJUSTMENT, or a receive without a
@@ -90,6 +98,10 @@ class StockMove(TenantMixin, ModelBase):
         Index("idx_xstock_move_tenant_product_date", "tenant_id", "product_id", "move_date"),
         Index("idx_xstock_move_tenant_warehouse_date", "tenant_id", "warehouse_id", "move_date"),
         Index("idx_xstock_move_tenant_reference", "tenant_id", "source_reference"),
+        Index(
+            "uq_xstock_move_tenant_idempotency",
+            "tenant_id", "idempotency_key", "idempotency_rank", unique=True,
+        ),
     )
 
     def __repr__(self) -> str:
