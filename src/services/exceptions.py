@@ -38,6 +38,14 @@ class DuplicateStockLocationCodeError(Exception):
         self.code = code
 
 
+class InvalidQuantityError(ValueError):
+    """Quantité de mouvement non strictement positive (ou non finie)."""
+
+    def __init__(self, quantity: float) -> None:
+        super().__init__(f"quantity must be a finite number > 0, got {quantity!r}")
+        self.quantity = quantity
+
+
 class InsufficientStockError(Exception):
     def __init__(self, product_id: str, requested: float, available: float) -> None:
         super().__init__(

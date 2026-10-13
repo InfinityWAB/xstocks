@@ -28,6 +28,7 @@ from .services.exceptions import (
     ControlledSubstanceRequiresLotTrackingError,
     InsufficientDemandHistoryError,
     InsufficientStockError,
+    InvalidQuantityError,
     InvalidWitnessError,
     ProductNotFoundError,
     WitnessRequiredError,
@@ -204,6 +205,8 @@ class IPCCommands(AutoDispatchMixin):
             return error(str(exc), code="invalid_witness")
         except ControlledSubstanceRequiresLotTrackingError as exc:
             return error(str(exc), code="invalid_product_config")
+        except InvalidQuantityError as exc:
+            return error(str(exc), code="invalid_quantity")
         except InsufficientStockError as exc:
             return error(str(exc), code="insufficient_stock")
         return ok(result={"moves": [m.model_dump(mode="json") for m in moves]})
