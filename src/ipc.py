@@ -148,6 +148,7 @@ class IPCCommands(AutoDispatchMixin):
             "unit_cost": (Optional[float], None),
             "source_reference": (Optional[str], None),
             "reason": (Optional[str], None),
+            "idempotency_key": (Optional[str], None),
         },
         output={"move": dict},
         type_response="model",
@@ -167,6 +168,7 @@ class IPCCommands(AutoDispatchMixin):
                 unit_cost=payload.unit_cost,
                 source_reference=payload.source_reference,
                 reason=payload.reason,
+                idempotency_key=payload.idempotency_key,
             )
         except ProductNotFoundError as exc:
             return error(str(exc), code="not_found")
@@ -186,6 +188,7 @@ class IPCCommands(AutoDispatchMixin):
             "witness_id": (Optional[str], None),
             "source_reference": (Optional[str], None),
             "reason": (Optional[str], None),
+            "idempotency_key": (Optional[str], None),
         },
         output={"moves": list},
         type_response="model",
@@ -204,6 +207,7 @@ class IPCCommands(AutoDispatchMixin):
                 witness_id=payload.witness_id,
                 source_reference=payload.source_reference,
                 reason=payload.reason,
+                idempotency_key=payload.idempotency_key,
             )
         except ProductNotFoundError as exc:
             return error(str(exc), code="not_found")

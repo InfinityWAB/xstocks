@@ -24,10 +24,14 @@ each gets its own method instead.
 """
 from __future__ import annotations
 
+import hashlib
 import math
 from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import uuid4
+
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from ..algorithms.controlled_substances import next_sequence_number
 from ..algorithms.picking import Allocation, BatchCandidate, select_batches
@@ -93,6 +97,45 @@ class StockMovementService:
         if not (access or {}).get("has_access", False):
             raise InvalidWitnessError(witness_id, "not a member of the current tenant")
 
+    # ── Idempotence ──────────────────────────────────────────
+
+    @staticmethod
+    def _idem_key(
+        move_type: Any, product_id: str, warehouse_id: str, idempotency_key: Optional[str]
+    ) -> Optional[str]:
+        """Clé interne (hachée) d'une opération, ou None sans idempotency_key.
+
+        source_reference seul NE convient PAS : xsales (SO:<n>), xpurchase
+        (GRN:<n>), xfleet (Vehicle:<id>) et xassets le réutilisent légitimement
+        pour des expéditions/réceptions/pleins successifs du même produit. Le
+        rejeu n'est donc détecté que si l'appelant fournit une clé explicite
+        (un identifiant stable par tentative logique), liée au type de
+        mouvement, au produit et à l'entrepôt.
+        """
+        if not idempotency_key:
+            return None
+        raw = f"{getattr(move_type, 'value', move_type)}|{product_id}|{warehouse_id}|{idempotency_key}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _slot(key: Optional[str], rank: int) -> Optional[str]:
+        return f"{key}:{rank}" if key else None
+
+    async def _replay(
+        self, session: "AsyncSession", key: Optional[str]
+    ) -> list[StockMoveResponse]:
+        """Mouvements déjà enregistrés pour cette clé (rang croissant), [] sinon."""
+        if key is None:
+            return []
+        result = await session.execute(
+            select(StockMove).where(
+                StockMove.tenant_id == self.tenant_id,
+                StockMove.idempotency_key.startswith(f"{key}:"),
+            )
+        )
+        moves = sorted(result.scalars().all(), key=lambda m: int(m.idempotency_key.rsplit(":", 1)[1]))
+        return await self._move_responses(session, moves) if moves else []
+
     # ── Receive (IN) ─────────────────────────────────────────
 
     async def receive(
@@ -109,70 +152,100 @@ class StockMovementService:
         source_reference: Optional[str] = None,
         reason: Optional[str] = None,
         move_date: Optional[datetime] = None,
+        idempotency_key: Optional[str] = None,
     ) -> StockMoveResponse:
         _require_positive(quantity)
+        key = self._idem_key(StockMoveType.IN, product_id, warehouse_id, idempotency_key)
         async with self._db.session() as session:
             async with session.begin():
-                product = await ProductRepository(session).get(product_id, self.tenant_id)
-                if product is None:
-                    raise ProductNotFoundError(product_id)
-
-                location_id = await self._resolve_location(session, warehouse_id, location_id)
-
-                batch_id = None
-                if product.is_lot_tracked:
-                    if not batch_number:
-                        raise ValueError("batch_number is required for lot-tracked products")
-                    batch_repo = BatchRepository(session)
-                    batch = await batch_repo.get_by_number(product_id, batch_number, self.tenant_id)
-                    if batch is None:
-                        batch = await batch_repo.save(
-                            Batch(
-                                tenant_id=self.tenant_id,
-                                product_id=product_id,
-                                batch_number=batch_number,
-                                expiry_date=expiry_date,
-                                initial_quantity=quantity,
-                            )
+                replay = await self._replay(session, key)
+                if replay:
+                    return replay[0]
+                try:
+                    async with session.begin_nested():
+                        return await self._receive_in_tx(
+                            session, key, product_id=product_id, warehouse_id=warehouse_id,
+                            quantity=quantity, created_by=created_by, location_id=location_id,
+                            batch_number=batch_number, expiry_date=expiry_date, unit_cost=unit_cost,
+                            source_reference=source_reference, reason=reason, move_date=move_date,
                         )
-                    batch_id = batch.id
+                except IntegrityError:
+                    # Course : un appel concurrent de même clé a inséré avant nous. Le
+                    # SAVEPOINT a annulé notre ajustement de niveau et notre mouvement.
+                    if key is None:
+                        raise
+                    replay = await self._replay(session, key)
+                    if not replay:
+                        raise
+                    return replay[0]
 
-                balance_before, balance_after = await self._adjust_level(
-                    session, product_id, warehouse_id, location_id, batch_id, quantity
-                )
+    async def _receive_in_tx(
+        self, session: "AsyncSession", key: Optional[str], *, product_id: str, warehouse_id: str,
+        quantity: float, created_by: str, location_id: Optional[str], batch_number: Optional[str],
+        expiry_date: Optional[date], unit_cost: Optional[float], source_reference: Optional[str],
+        reason: Optional[str], move_date: Optional[datetime],
+    ) -> StockMoveResponse:
+        product = await ProductRepository(session).get(product_id, self.tenant_id)
+        if product is None:
+            raise ProductNotFoundError(product_id)
 
-                effective_cost = unit_cost if unit_cost is not None else product.purchase_price
-                move = await self._create_move(
-                    session,
-                    product_id=product_id,
-                    batch_id=batch_id,
-                    warehouse_id=warehouse_id,
-                    move_type=StockMoveType.IN,
-                    quantity=quantity,
-                    created_by=created_by,
-                    destination_location_id=location_id,
-                    unit_cost=effective_cost,
-                    total_value=effective_cost * quantity if effective_cost is not None else None,
-                    balance_before=balance_before,
-                    balance_after=balance_after,
-                    source_reference=source_reference,
-                    reason=reason,
-                    move_date=move_date,
-                )
+        location_id = await self._resolve_location(session, warehouse_id, location_id)
 
-                if effective_cost is not None:
-                    await self._open_layer(
-                        session,
+        batch_id = None
+        if product.is_lot_tracked:
+            if not batch_number:
+                raise ValueError("batch_number is required for lot-tracked products")
+            batch_repo = BatchRepository(session)
+            batch = await batch_repo.get_by_number(product_id, batch_number, self.tenant_id)
+            if batch is None:
+                batch = await batch_repo.save(
+                    Batch(
+                        tenant_id=self.tenant_id,
                         product_id=product_id,
-                        batch_id=batch_id,
-                        warehouse_id=warehouse_id,
-                        source_move_id=move.id,
-                        unit_cost=effective_cost,
-                        quantity=quantity,
-                        received_at=move.move_date,
+                        batch_number=batch_number,
+                        expiry_date=expiry_date,
+                        initial_quantity=quantity,
                     )
-                warehouse_name = await self._warehouse_name(session, warehouse_id)
-            return self._move_response(move, product.name, warehouse_name)
+                )
+            batch_id = batch.id
+
+        balance_before, balance_after = await self._adjust_level(
+            session, product_id, warehouse_id, location_id, batch_id, quantity
+        )
+
+        effective_cost = unit_cost if unit_cost is not None else product.purchase_price
+        move = await self._create_move(
+            session,
+            product_id=product_id,
+            batch_id=batch_id,
+            warehouse_id=warehouse_id,
+            move_type=StockMoveType.IN,
+            quantity=quantity,
+            created_by=created_by,
+            destination_location_id=location_id,
+            unit_cost=effective_cost,
+            total_value=effective_cost * quantity if effective_cost is not None else None,
+            balance_before=balance_before,
+            balance_after=balance_after,
+            source_reference=source_reference,
+            reason=reason,
+            move_date=move_date,
+            idempotency_key=self._slot(key, 0),
+        )
+
+        if effective_cost is not None:
+            await self._open_layer(
+                session,
+                product_id=product_id,
+                batch_id=batch_id,
+                warehouse_id=warehouse_id,
+                source_move_id=move.id,
+                unit_cost=effective_cost,
+                quantity=quantity,
+                received_at=move.move_date,
+            )
+        warehouse_name = await self._warehouse_name(session, warehouse_id)
+        return self._move_response(move, product.name, warehouse_name)
 
     # ── Issue (OUT) ──────────────────────────────────────────
 
@@ -188,104 +261,132 @@ class StockMovementService:
         source_reference: Optional[str] = None,
         reason: Optional[str] = None,
         move_date: Optional[datetime] = None,
+        idempotency_key: Optional[str] = None,
     ) -> list[StockMoveResponse]:
         _require_positive(quantity)
+        key = self._idem_key(StockMoveType.OUT, product_id, warehouse_id, idempotency_key)
         async with self._db.session() as session:
             async with session.begin():
-                product = await ProductRepository(session).get(product_id, self.tenant_id)
-                if product is None:
-                    raise ProductNotFoundError(product_id)
-                if product.is_controlled_substance and not witness_id:
-                    raise WitnessRequiredError(product_id)
-                if product.is_controlled_substance and witness_id:
-                    # Vérifié hors transaction-critique n'est pas possible ici
-                    # (il faut product.is_controlled_substance, déjà lu) — l'appel
-                    # IPC reste bref (un aller-retour) et xauth.tenant_access
-                    # ne fait qu'une lecture.
-                    await self._validate_witness(witness_id, created_by)
+                replay = await self._replay(session, key)
+                if replay:
+                    return replay
+                try:
+                    async with session.begin_nested():
+                        return await self._issue_in_tx(
+                            session, key, product_id=product_id, warehouse_id=warehouse_id,
+                            quantity=quantity, created_by=created_by, location_id=location_id,
+                            witness_id=witness_id, source_reference=source_reference,
+                            reason=reason, move_date=move_date,
+                        )
+                except IntegrityError:
+                    if key is None:
+                        raise
+                    replay = await self._replay(session, key)
+                    if not replay:
+                        raise
+                    return replay
 
-                location_id = await self._resolve_location(session, warehouse_id, location_id)
+    async def _issue_in_tx(
+        self, session: "AsyncSession", key: Optional[str], *, product_id: str, warehouse_id: str,
+        quantity: float, created_by: str, location_id: Optional[str], witness_id: Optional[str],
+        source_reference: Optional[str], reason: Optional[str], move_date: Optional[datetime],
+    ) -> list[StockMoveResponse]:
+        product = await ProductRepository(session).get(product_id, self.tenant_id)
+        if product is None:
+            raise ProductNotFoundError(product_id)
+        if product.is_controlled_substance and not witness_id:
+            raise WitnessRequiredError(product_id)
+        if product.is_controlled_substance and witness_id:
+            # Vérifié hors transaction-critique n'est pas possible ici
+            # (il faut product.is_controlled_substance, déjà lu) — l'appel
+            # IPC reste bref (un aller-retour) et xauth.tenant_access
+            # ne fait qu'une lecture.
+            await self._validate_witness(witness_id, created_by)
 
-                moves: list[StockMove] = []
+        location_id = await self._resolve_location(session, warehouse_id, location_id)
 
-                if not product.is_lot_tracked:
-                    if product.is_controlled_substance:
-                        raise ControlledSubstanceRequiresLotTrackingError(product_id)
+        moves: list[StockMove] = []
 
-                    balance_before, balance_after = await self._adjust_level(
-                        session, product_id, warehouse_id, location_id, None, -quantity, allow_negative=False
-                    )
-                    unit_cost, total_value = await self._consume_cost(
+        if not product.is_lot_tracked:
+            if product.is_controlled_substance:
+                raise ControlledSubstanceRequiresLotTrackingError(product_id)
+
+            balance_before, balance_after = await self._adjust_level(
+                session, product_id, warehouse_id, location_id, None, -quantity, allow_negative=False
+            )
+            unit_cost, total_value = await self._consume_cost(
+                session,
+                product_id=product_id,
+                batch_id=None,
+                warehouse_id=warehouse_id,
+                quantity=quantity,
+                method=product.valuation_method,
+            )
+            move = await self._create_move(
+                session,
+                product_id=product_id,
+                batch_id=None,
+                warehouse_id=warehouse_id,
+                move_type=StockMoveType.OUT,
+                quantity=quantity,
+                created_by=created_by,
+                source_location_id=location_id,
+                unit_cost=unit_cost,
+                total_value=total_value,
+                balance_before=balance_before,
+                balance_after=balance_after,
+                source_reference=source_reference,
+                reason=reason,
+                move_date=move_date,
+                idempotency_key=self._slot(key, 0),
+            )
+            moves.append(move)
+        else:
+            allocations = await self._pick_batches(session, product, warehouse_id, quantity)
+            for rank, allocation in enumerate(allocations):
+                balance_before, balance_after = await self._adjust_level(
+                    session, product_id, warehouse_id, location_id, allocation.batch_id,
+                    -allocation.quantity, allow_negative=False,
+                )
+                unit_cost, total_value = await self._consume_cost(
+                    session,
+                    product_id=product_id,
+                    batch_id=allocation.batch_id,
+                    warehouse_id=warehouse_id,
+                    quantity=allocation.quantity,
+                    method=product.valuation_method,
+                )
+                move = await self._create_move(
+                    session,
+                    product_id=product_id,
+                    batch_id=allocation.batch_id,
+                    warehouse_id=warehouse_id,
+                    move_type=StockMoveType.OUT,
+                    quantity=allocation.quantity,
+                    created_by=created_by,
+                    source_location_id=location_id,
+                    unit_cost=unit_cost,
+                    total_value=total_value,
+                    balance_before=balance_before,
+                    balance_after=balance_after,
+                    source_reference=source_reference,
+                    reason=reason,
+                    move_date=move_date,
+                    idempotency_key=self._slot(key, rank),
+                )
+                moves.append(move)
+                if product.is_controlled_substance:
+                    await self._register_controlled_substance(
                         session,
                         product_id=product_id,
-                        batch_id=None,
-                        warehouse_id=warehouse_id,
-                        quantity=quantity,
-                        method=product.valuation_method,
+                        batch_id=allocation.batch_id,
+                        move_id=move.id,
+                        signatory_id=created_by,
+                        witness_id=witness_id,
                     )
-                    move = await self._create_move(
-                        session,
-                        product_id=product_id,
-                        batch_id=None,
-                        warehouse_id=warehouse_id,
-                        move_type=StockMoveType.OUT,
-                        quantity=quantity,
-                        created_by=created_by,
-                        source_location_id=location_id,
-                        unit_cost=unit_cost,
-                        total_value=total_value,
-                        balance_before=balance_before,
-                        balance_after=balance_after,
-                        source_reference=source_reference,
-                        reason=reason,
-                        move_date=move_date,
-                    )
-                    moves.append(move)
-                else:
-                    allocations = await self._pick_batches(session, product, warehouse_id, quantity)
-                    for allocation in allocations:
-                        balance_before, balance_after = await self._adjust_level(
-                            session, product_id, warehouse_id, location_id, allocation.batch_id,
-                            -allocation.quantity, allow_negative=False,
-                        )
-                        unit_cost, total_value = await self._consume_cost(
-                            session,
-                            product_id=product_id,
-                            batch_id=allocation.batch_id,
-                            warehouse_id=warehouse_id,
-                            quantity=allocation.quantity,
-                            method=product.valuation_method,
-                        )
-                        move = await self._create_move(
-                            session,
-                            product_id=product_id,
-                            batch_id=allocation.batch_id,
-                            warehouse_id=warehouse_id,
-                            move_type=StockMoveType.OUT,
-                            quantity=allocation.quantity,
-                            created_by=created_by,
-                            source_location_id=location_id,
-                            unit_cost=unit_cost,
-                            total_value=total_value,
-                            balance_before=balance_before,
-                            balance_after=balance_after,
-                            source_reference=source_reference,
-                            reason=reason,
-                            move_date=move_date,
-                        )
-                        moves.append(move)
-                        if product.is_controlled_substance:
-                            await self._register_controlled_substance(
-                                session,
-                                product_id=product_id,
-                                batch_id=allocation.batch_id,
-                                move_id=move.id,
-                                signatory_id=created_by,
-                                witness_id=witness_id,
-                            )
 
-                warehouse_name = await self._warehouse_name(session, warehouse_id)
-            return [self._move_response(m, product.name, warehouse_name) for m in moves]
+        warehouse_name = await self._warehouse_name(session, warehouse_id)
+        return [self._move_response(m, product.name, warehouse_name) for m in moves]
 
     # ── Adjustment ───────────────────────────────────────────
 
@@ -664,6 +765,7 @@ class StockMovementService:
         source_reference: Optional[str] = None,
         reason: Optional[str] = None,
         move_date: Optional[datetime] = None,
+        idempotency_key: Optional[str] = None,
     ) -> StockMove:
         move = StockMove(
             tenant_id=self.tenant_id,
@@ -679,6 +781,7 @@ class StockMovementService:
             balance_before=balance_before,
             balance_after=balance_after,
             source_reference=source_reference,
+            idempotency_key=idempotency_key,
             reason=reason,
             created_by=created_by,
             move_date=move_date or datetime.now(timezone.utc),

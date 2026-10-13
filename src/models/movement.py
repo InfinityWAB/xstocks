@@ -70,6 +70,12 @@ class StockMove(TenantMixin, ModelBase):
     source_reference: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # required if type=adjustment
 
+    # Clé d'idempotence d'un mouvement : "<sha256(type|produit|entrepôt|clé appelant)>:<n>"
+    # (n = rang du mouvement dans l'appel, plusieurs lots => plusieurs mouvements).
+    # NULL tant que l'appelant ne fournit pas d'idempotency_key (comportement
+    # historique inchangé). Unique par tenant : un rejeu ne peut pas insérer deux fois.
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
     # Costing — populated by the valuation engine (algorithms/valuation.py) on
     # IN (declared/purchase cost) and OUT (FIFO/LIFO/CMUP-consumed cost).
     # Null when no cost is known (e.g. ADJUSTMENT, or a receive without a
@@ -90,6 +96,7 @@ class StockMove(TenantMixin, ModelBase):
         Index("idx_xstock_move_tenant_product_date", "tenant_id", "product_id", "move_date"),
         Index("idx_xstock_move_tenant_warehouse_date", "tenant_id", "warehouse_id", "move_date"),
         Index("idx_xstock_move_tenant_reference", "tenant_id", "source_reference"),
+        Index("uq_xstock_move_tenant_idempotency", "tenant_id", "idempotency_key", unique=True),
     )
 
     def __repr__(self) -> str:
