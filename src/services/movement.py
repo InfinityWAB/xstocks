@@ -24,6 +24,7 @@ each gets its own method instead.
 """
 from __future__ import annotations
 
+import math
 from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import uuid4
@@ -47,6 +48,7 @@ from ..schemas.pharma import ControlledSubstanceRegisterResponse
 from .exceptions import (
     ControlledSubstanceRequiresLotTrackingError,
     InsufficientStockError,
+    InvalidQuantityError,
     InvalidWitnessError,
     ProductNotFoundError,
     WitnessRequiredError,
@@ -56,6 +58,13 @@ from .settings import StockSettingsService
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
     from xcore.services.database.adapters.async_sql import AsyncSQLAdapter as DatabaseService
+
+
+
+def _require_positive(quantity: float) -> None:
+    """Refuse toute quantité <= 0, NaN ou infinie : un OUT négatif créerait du stock."""
+    if not isinstance(quantity, (int, float)) or isinstance(quantity, bool) or not math.isfinite(quantity) or quantity <= 0:
+        raise InvalidQuantityError(quantity)
 
 
 class StockMovementService:
@@ -101,6 +110,7 @@ class StockMovementService:
         reason: Optional[str] = None,
         move_date: Optional[datetime] = None,
     ) -> StockMoveResponse:
+        _require_positive(quantity)
         async with self._db.session() as session:
             async with session.begin():
                 product = await ProductRepository(session).get(product_id, self.tenant_id)
@@ -179,6 +189,7 @@ class StockMovementService:
         reason: Optional[str] = None,
         move_date: Optional[datetime] = None,
     ) -> list[StockMoveResponse]:
+        _require_positive(quantity)
         async with self._db.session() as session:
             async with session.begin():
                 product = await ProductRepository(session).get(product_id, self.tenant_id)
@@ -339,6 +350,7 @@ class StockMovementService:
         source_reference: Optional[str] = None,
         move_date: Optional[datetime] = None,
     ) -> tuple[StockMoveResponse, StockMoveResponse]:
+        _require_positive(quantity)
         if source_warehouse_id == destination_warehouse_id:
             raise ValueError("source and destination warehouses must differ")
 
