@@ -115,16 +115,24 @@ class AlertService:
         ]
 
         if recipients.role_id:
-            matched = [m for m in members if m.get("role_id") == recipients.role_id]
-            if not matched:
-                # xauth.users.list.tenant n'expose pas role_id : le filtre par
-                # rôle ne peut rien résoudre. Ne pas rester silencieux.
-                logger.warning(
-                    "alert role_id filter resolved no recipient: xauth.users.list.tenant does not expose role_id",
-                    tenant_id=self.tenant_id,
-                    role_id=recipients.role_id,
-                    members=len(members),
-                )
+            # xauth.users.list.tenant n'expose pas role_id : on interroge
+            # l'action existante xauth.member.list_roles (par membre, scopée
+            # au tenant courant) — O(membres) appels IPC, comme `permission`.
+            matched = []
+            for member in members:
+                try:
+                    res = await self._call_plugin(
+                        "auth",
+                        "xauth.member.list_roles",
+                        {"tenant_id": self.tenant_id, "user_id": member["user_id"]},
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "xauth.member.list_roles(%s) failed: %s", member.get("user_id"), exc
+                    )
+                    continue
+                if recipients.role_id in (res or {}).get("role_ids", []):
+                    matched.append(member)
             return matched
 
         if recipients.permission:

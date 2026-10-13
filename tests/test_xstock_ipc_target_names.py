@@ -62,21 +62,3 @@ async def test_movement_temoin_cible_auth():
     svc = StockMovementService(None, "t1", call_plugin=rec)
     await svc._validate_witness("w", "actor")
     assert rec.calls == [(AUTH_TARGET, "xauth.tenant_access")]
-
-
-@pytest.mark.asyncio
-async def test_filtre_role_id_vide_journalise_un_avertissement(monkeypatch):
-    from src.services import alert as alert_mod
-
-    records = []
-
-    class FakeLogger:
-        def warning(self, msg, *args, **kw):
-            records.append((msg, kw))
-
-    monkeypatch.setattr(alert_mod, "logger", FakeLogger())
-    out = await AlertService("t1", Recorder())._resolve_recipients(
-        AlertRecipients(role_id="r1")
-    )
-    assert out == []
-    assert any(kw.get("role_id") == "r1" and kw.get("tenant_id") == "t1" for _, kw in records)
