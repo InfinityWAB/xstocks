@@ -2,6 +2,7 @@ import { definePlugin } from '@infintywab/plugin-sdk'
 import { isLowStock, lowStockProducts, quantityByProduct, stockValue as computeStockValue, warehouseStats } from './lib/stockMetrics.js'
 import { fetchAllPages, truncationNotice } from './lib/pagination.js'
 import { screenKind, classifyError, SCREEN_MESSAGES } from './lib/screenState.js'
+import { STOCK_ACCESS_PERMISSION } from './lib/permissions.js'
 
 const BASE = '/app/xstock'
 const modalRoot = document.getElementById('modal-root') || document.body
@@ -3398,10 +3399,10 @@ export default definePlugin((app) => {
   const a = api(app)
   app.registerRoutes([
     { path: '/stock', component: () => React.createElement(StockPage, { app, api: a, tab: currentTab }),
-      meta: { title: app.t('stock.name'), permission: 'stock:products:read' } },
+      meta: { title: app.t('stock.name'), permission: STOCK_ACCESS_PERMISSION } },
   ])
   app.registerSidebar([
-    { label: app.t('stock.name'), path: '/stock', icon: 'package', section: 'Opérations', order: 10, permission: 'stock:products:read' },
+    { label: app.t('stock.name'), path: '/stock', icon: 'package', section: 'Opérations', order: 10, permission: STOCK_ACCESS_PERMISSION },
   ])
   app.registerDashboardWidget({
     id: 'stock.overview', title: 'Aperçu Stock', component: () => React.createElement(DashboardWidget, { api: a }), defaultSize: 'md',
