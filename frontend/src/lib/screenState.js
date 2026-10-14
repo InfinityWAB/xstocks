@@ -16,14 +16,28 @@ export function screenKind({ loading = false, error = null, offline = false, dat
   return 'empty'
 }
 
+// Message lisible pour l'utilisateur : jamais le texte brut de l'exception
+// (il peut contenir trace, SQL, chemins serveur).
+function readableMessage(status, network) {
+  if (network) return 'Connexion indisponible.'
+  if (status === 404) return 'Ressource introuvable (404).'
+  if (status === 401) return 'Session expirée, reconnectez-vous (401).'
+  if (status >= 500) return `Erreur du serveur (${status}). Réessayez dans un instant.`
+  if (status >= 400) return `Requête refusée par le serveur (${status}).`
+  return 'Une erreur inattendue est survenue.'
+}
+
 // Classe une exception d'appel API : { error, offline, forbidden } à passer à screenKind.
+// « Accès refusé » uniquement sur statut 403 ou code explicite, jamais sur le texte du message.
 export function classifyError(e, online = (typeof navigator === 'undefined' ? true : navigator.onLine !== false)) {
   if (!e) return { error: null, offline: false, forbidden: false }
-  const status = e.status ?? e.statusCode ?? e.response?.status
+  const status = Number(e.status ?? e.statusCode ?? e.response?.status) || undefined
+  const code = String(e.code ?? '').toUpperCase()
   const msg = String(e.message ?? e)
-  const forbidden = status === 403 || /\b403\b|forbidden|permission/i.test(msg)
+  const forbidden = status === 403 || code === 'FORBIDDEN' || code === 'PERMISSION_DENIED'
   const network = !online || /failed to fetch|networkerror|network request|load failed|ERR_NETWORK|ECONN/i.test(msg)
-  return { error: msg || 'Erreur inconnue', offline: network && !forbidden, forbidden }
+  const offline = network && !forbidden
+  return { error: readableMessage(status, offline), offline, forbidden }
 }
 
 export const SCREEN_MESSAGES = {
