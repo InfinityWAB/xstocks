@@ -1,4 +1,5 @@
 import { definePlugin } from '@infintywab/plugin-sdk'
+import { screenKind, classifyError, SCREEN_MESSAGES } from './lib/screenState.js'
 
 const BASE = '/app/xstock'
 const modalRoot = document.getElementById('modal-root') || document.body
@@ -709,6 +710,23 @@ function EmptyState({ icon, title, hint, action }) {
   )
 }
 
+// État d'écran d'une liste qui n'a pas pu se charger : message clair + « Réessayer ».
+// `failure` = résultat de classifyError(). Distinct d'EmptyState (« aucune donnée »).
+function ScreenState({ failure, onRetry }) {
+  const kind = screenKind({ error: failure?.error, offline: failure?.offline, forbidden: failure?.forbidden, data: [] })
+  if (kind !== 'error' && kind !== 'offline' && kind !== 'forbidden') return null
+  const m = SCREEN_MESSAGES[kind]
+  return React.createElement('div', {
+    role: kind === 'error' ? 'alert' : 'status',
+    style: { display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8, padding: '56px 24px', textAlign: 'center' },
+  },
+    React.createElement('div', { style: { fontWeight: 700, color: 'var(--color-danger)', fontSize: 14 } }, m.title),
+    React.createElement('div', { style: { fontSize: 12, color: 'var(--color-text-tertiary)', maxWidth: 420 } }, m.message),
+    failure?.error && kind === 'error' && React.createElement('div', { style: { fontSize: 11, color: 'var(--color-text-tertiary)' } }, `Détail : ${failure.error}`),
+    kind !== 'forbidden' && onRetry && React.createElement('button', { style: { ...S.btnPrimary, marginTop: 8 }, onClick: onRetry }, 'Réessayer'),
+  )
+}
+
 /* ════════════════════════════════════════════════════════════════════════
    PRODUCTS TAB
    ════════════════════════════════════════════════════════════════════════ */
@@ -718,6 +736,7 @@ function ProductsTab({ app, api, onNavigate }) {
   const [warehouses, setWarehouses] = useState([])
   const [levels, setLevels] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
   const [search, setSearch] = useState('')
   const [categoryFilter, setCategoryFilter] = useState('all')
   const [statusFilter, setStatusFilter] = useState('active')
@@ -742,8 +761,8 @@ function ProductsTab({ app, api, onNavigate }) {
     if (!silent) setLoading(true)
     try {
       const [p, w, l] = await Promise.all([api.products.list(), api.warehouses.list(), api.movements.levels()])
-      setProducts(p ?? []); setWarehouses(w ?? []); setLevels(l ?? [])
-    } catch (e) { if (!silent) app.notify('Erreur chargement produits', 'error') }
+      setProducts(p ?? []); setWarehouses(w ?? []); setLevels(l ?? []); setLoadError(null)
+    } catch (e) { if (!silent) setLoadError(classifyError(e)) }
     if (!silent) setLoading(false)
   }, [])
 
@@ -943,6 +962,7 @@ function ProductsTab({ app, api, onNavigate }) {
   const productName = deletingId ? products.find(p => p.id === deletingId)?.name : ''
 
   if (loading) return React.createElement(TableSkeleton, { cols: 6 })
+  if (loadError) return React.createElement(ScreenState, { failure: loadError, onRetry: () => load() })
 
   const allVisibleSelected = sorted.length > 0 && sorted.every(p => selected.has(p.id))
   const someVisibleSelected = sorted.some(p => selected.has(p.id))
@@ -1590,6 +1610,7 @@ function WarehousesTab({ app, api, onNavigate }) {
   const [levels, setLevels] = useState([])
   const [moves, setMoves] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
   const [search, setSearch] = useState('')
   const [detailWarehouse, setDetailWarehouse] = useState(null)
   const [formOpen, setFormOpen] = useState(false)
@@ -1600,8 +1621,8 @@ function WarehousesTab({ app, api, onNavigate }) {
     if (!silent) setLoading(true)
     try {
       const [w, p, l, m] = await Promise.all([api.warehouses.list(), api.products.list(), api.movements.levels(), api.movements.list()])
-      setWarehouses(w ?? []); setProducts(p ?? []); setLevels(l ?? []); setMoves(m ?? [])
-    } catch (e) { if (!silent) app.notify('Erreur chargement', 'error') }
+      setWarehouses(w ?? []); setProducts(p ?? []); setLevels(l ?? []); setMoves(m ?? []); setLoadError(null)
+    } catch (e) { if (!silent) setLoadError(classifyError(e)) }
     if (!silent) setLoading(false)
   }, [])
 
@@ -1678,6 +1699,7 @@ function WarehousesTab({ app, api, onNavigate }) {
   }, [editingWarehouse, load])
 
   if (loading) return Spinner()
+  if (loadError) return React.createElement(ScreenState, { failure: loadError, onRetry: () => load() })
 
   const emptyStats = { skus: new Set(), units: 0, value: 0, alerts: new Set() }
 
@@ -1809,6 +1831,7 @@ function MovementsTab({ app, api }) {
   const [products, setProducts] = useState([])
   const [warehouses, setWarehouses] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
   const [typeFilter, setTypeFilter] = useState('ALL')
   const [formOpen, setFormOpen] = useState(false)
   const [formKind, setFormKind] = useState('receive')
@@ -1823,7 +1846,8 @@ function MovementsTab({ app, api }) {
       setMoves(m ?? [])
       setProducts(p ?? [])
       setWarehouses(w ?? [])
-    } catch (e) { if (!silent) app.notify('Erreur chargement', 'error') }
+      setLoadError(null)
+    } catch (e) { if (!silent) setLoadError(classifyError(e)) }
     if (!silent) setLoading(false)
   }, [])
 
@@ -1848,6 +1872,7 @@ function MovementsTab({ app, api }) {
   }, [moves, typeFilter])
 
   if (loading) return React.createElement(TableSkeleton, { cols: 7 })
+  if (loadError) return React.createElement(ScreenState, { failure: loadError, onRetry: () => load() })
 
   return React.createElement(Fragment, null,
     React.createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10 } },
@@ -2028,15 +2053,16 @@ const INVENTORY_STATUS_LABELS = {
 function InventoryDetailModal({ app, api, count, onClose, onChanged }) {
   const [lines, setLines] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
   const [savingLineId, setSavingLineId] = useState(null)
   const [overrideReason, setOverrideReason] = useState('')
   const [validating, setValidating] = useState(false)
   const [cancelling, setCancelling] = useState(false)
 
   const load = useCallback(async () => {
-    setLoading(true)
+    setLoading(true); setLoadError(null)
     try { setLines(await api.inventory.lines(count.id) ?? []) }
-    catch (e) { app.notify('Erreur chargement des lignes', 'error') }
+    catch (e) { setLoadError(classifyError(e)) }
     setLoading(false)
   }, [count.id])
 
@@ -2088,7 +2114,9 @@ function InventoryDetailModal({ app, api, count, onClose, onChanged }) {
         React.createElement(Badge, { status: count.status, label: INVENTORY_STATUS_LABELS[count.status] ?? count.status }),
         isOpen && uncounted > 0 && React.createElement('span', { style: { fontSize: 12, color: 'var(--color-text-tertiary)' } }, `${uncounted} ligne(s) non comptée(s)`),
       ),
-      loading
+      loadError
+        ? React.createElement(ScreenState, { failure: loadError, onRetry: load })
+        : loading
         ? React.createElement(TableSkeleton, { rows: 4, cols: 4 })
         : lines.length === 0
           ? React.createElement(EmptyState, { icon: Icon.clipboard, title: 'Aucune ligne', hint: 'Cet inventaire ne contient aucun produit.' })
@@ -2134,6 +2162,7 @@ function InventoryTab({ app, api }) {
   const [counts, setCounts] = useState([])
   const [warehouses, setWarehouses] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
   const [statusFilter, setStatusFilter] = useState('ALL')
   const [formOpen, setFormOpen] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -2146,9 +2175,9 @@ function InventoryTab({ app, api }) {
     try {
       const whs = await api.warehouses.list() ?? []
       setWarehouses(whs)
-      const perWarehouse = await Promise.all(whs.map(w => api.inventory.byWarehouse(w.id).catch(() => [])))
-      setCounts(perWarehouse.flat())
-    } catch (e) { if (!silent) app.notify('Erreur chargement', 'error') }
+      const perWarehouse = await Promise.all(whs.map(w => api.inventory.byWarehouse(w.id)))
+      setCounts(perWarehouse.flat()); setLoadError(null)
+    } catch (e) { if (!silent) setLoadError(classifyError(e)) }
     if (!silent) setLoading(false)
   }, [])
 
@@ -2182,6 +2211,7 @@ function InventoryTab({ app, api }) {
   }, [load])
 
   if (loading) return React.createElement(TableSkeleton, { cols: 4 })
+  if (loadError) return React.createElement(ScreenState, { failure: loadError, onRetry: () => load() })
 
   return React.createElement(Fragment, null,
     React.createElement('div', { style: S.grid4 },
@@ -2277,11 +2307,12 @@ const TRANSFER_STATUS_LABELS = { draft: 'Brouillon', ready: 'Prêt', done: 'Term
 function TransferDetailModal({ app, api, transfer, onClose, busy, onAction }) {
   const [lines, setLines] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
 
   const load = useCallback(async () => {
-    setLoading(true)
+    setLoading(true); setLoadError(null)
     try { setLines(await api.transfers.lines(transfer.id) ?? []) }
-    catch (e) { app.notify('Erreur chargement des lignes', 'error') }
+    catch (e) { setLoadError(classifyError(e)) }
     setLoading(false)
   }, [transfer.id])
 
@@ -2298,7 +2329,9 @@ function TransferDetailModal({ app, api, transfer, onClose, busy, onAction }) {
         React.createElement(Badge, { status: transfer.status, label: TRANSFER_STATUS_LABELS[transfer.status] ?? transfer.status }),
         React.createElement('span', { style: { fontSize: 12, color: 'var(--color-text-tertiary)' } }, `Créé par ${transfer.createdBy}`),
       ),
-      loading
+      loadError
+        ? React.createElement(ScreenState, { failure: loadError, onRetry: load })
+        : loading
         ? React.createElement(TableSkeleton, { rows: 4, cols: 3 })
         : lines.length === 0
           ? React.createElement(EmptyState, { icon: Icon.arrows, title: 'Aucune ligne', hint: 'Ce transfert ne contient aucun produit.' })
@@ -2332,6 +2365,7 @@ function TransfersTab({ app, api }) {
   const [warehouses, setWarehouses] = useState([])
   const [products, setProducts] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
   const [statusFilter, setStatusFilter] = useState('ALL')
   const [formOpen, setFormOpen] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -2342,8 +2376,8 @@ function TransfersTab({ app, api }) {
     if (!silent) setLoading(true)
     try {
       const [t, w, p] = await Promise.all([api.transfers.list(), api.warehouses.list(), api.products.list()])
-      setTransfers(t ?? []); setWarehouses(w ?? []); setProducts(p ?? [])
-    } catch (e) { if (!silent) app.notify('Erreur chargement', 'error') }
+      setTransfers(t ?? []); setWarehouses(w ?? []); setProducts(p ?? []); setLoadError(null)
+    } catch (e) { if (!silent) setLoadError(classifyError(e)) }
     if (!silent) setLoading(false)
   }, [])
 
@@ -2381,6 +2415,7 @@ function TransfersTab({ app, api }) {
   const cancelledCount = useMemo(() => transfers.filter(t => t.status === 'cancelled').length, [transfers])
 
   if (loading) return React.createElement(TableSkeleton, { cols: 6 })
+  if (loadError) return React.createElement(ScreenState, { failure: loadError, onRetry: () => load() })
 
   return React.createElement(Fragment, null,
     React.createElement('div', { style: S.grid4 },
@@ -2523,6 +2558,7 @@ function IntelligenceTab({ app, api }) {
   const [products, setProducts] = useState([])
   const [warehouses, setWarehouses] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
 
   const [suggestions, setSuggestions] = useState([])
   const [suggestionsBusy, setSuggestionsBusy] = useState(false)
@@ -2542,16 +2578,15 @@ function IntelligenceTab({ app, api }) {
   const [classification, setClassification] = useState(null)
   const [classifyBusy, setClassifyBusy] = useState(false)
 
-  useEffect(() => {
-    (async () => {
-      setLoading(true)
+  const loadInitial = useCallback(async () => {
+      setLoading(true); setLoadError(null)
       try {
         const [p, w, s] = await Promise.all([api.products.list(), api.warehouses.list(), api.intelligence.pendingSuggestions()])
         setProducts(p ?? []); setWarehouses(w ?? []); setSuggestions(s ?? [])
-      } catch (e) { app.notify('Erreur chargement', 'error') }
+      } catch (e) { setLoadError(classifyError(e)) }
       setLoading(false)
-    })()
   }, [])
+  useEffect(() => { loadInitial() }, [loadInitial])
 
   const productName = useCallback((id) => products.find(p => p.id === id)?.name ?? id, [products])
 
@@ -2606,6 +2641,7 @@ function IntelligenceTab({ app, api }) {
   }, [])
 
   if (loading) return Spinner()
+  if (loadError) return React.createElement(ScreenState, { failure: loadError, onRetry: loadInitial })
 
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 20 } },
 
@@ -2758,6 +2794,7 @@ function AttachmentsTab({ app, api }) {
   const [products, setProducts] = useState([])
   const [warehouses, setWarehouses] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
   const [ownerType, setOwnerType] = useState('product')
   const [ownerId, setOwnerId] = useState('')
   const [attachments, setAttachments] = useState(null)
@@ -2765,16 +2802,15 @@ function AttachmentsTab({ app, api }) {
   const [uploading, setUploading] = useState(false)
   const [busyId, setBusyId] = useState(null)
 
-  useEffect(() => {
-    (async () => {
-      setLoading(true)
+  const loadInitial = useCallback(async () => {
+      setLoading(true); setLoadError(null)
       try {
         const [p, w] = await Promise.all([api.products.list(), api.warehouses.list()])
         setProducts(p ?? []); setWarehouses(w ?? [])
-      } catch (e) { app.notify('Erreur chargement', 'error') }
+      } catch (e) { setLoadError(classifyError(e)) }
       setLoading(false)
-    })()
   }, [])
+  useEffect(() => { loadInitial() }, [loadInitial])
 
   const loadAttachments = useCallback(async () => {
     if (!ownerId) return app.notify('Sélectionner ou saisir un identifiant', 'warning')
@@ -2813,6 +2849,7 @@ function AttachmentsTab({ app, api }) {
   }, [])
 
   if (loading) return Spinner()
+  if (loadError) return React.createElement(ScreenState, { failure: loadError, onRetry: loadInitial })
 
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 20 } },
     React.createElement('div', { style: { ...S.card, padding: 20 } },
@@ -2991,13 +3028,13 @@ function SettingsTab({ app, api }) {
   const [alerts, setAlerts] = useState([])
   const [members, setMembers] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
   const [targetingOpen, setTargetingOpen] = useState(false)
   const [targetingEdit, setTargetingEdit] = useState(null)
   const [savingTargeting, setSavingTargeting] = useState(false)
 
-  useEffect(() => {
-    (async () => {
-      setLoading(true)
+  const loadInitial = useCallback(async () => {
+      setLoading(true); setLoadError(null)
       try {
         const [s, a, m] = await Promise.all([api.settings.get(), api.settings.alerts(), api.settings.members()])
         setSettings(s ?? {})
@@ -3006,10 +3043,10 @@ function SettingsTab({ app, api }) {
         // aux schémas xstock) — normalise ici pour rester cohérent avec le
         // reste du fichier qui suppose du camelCase partout.
         setMembers((Array.isArray(m) ? m : []).map(x => ({ userId: x.user_id, email: x.email, roleId: x.role_id })))
-      } catch (e) { app.notify('Erreur chargement paramètres', 'error') }
+      } catch (e) { setLoadError(classifyError(e)) }
       setLoading(false)
-    })()
   }, [])
+  useEffect(() => { loadInitial() }, [loadInitial])
 
   const update = useCallback(async (patch) => {
     try {
@@ -3053,6 +3090,7 @@ function SettingsTab({ app, api }) {
   const creatableTypes = useMemo(() => ACTIVE_ALERT_TYPES.filter(t => !configuredTypes.has(t)), [configuredTypes])
 
   if (loading) return Spinner()
+  if (loadError) return React.createElement(ScreenState, { failure: loadError, onRetry: loadInitial })
 
   return React.createElement(Fragment, null,
     React.createElement('div', { style: S.grid2 },
@@ -3128,9 +3166,10 @@ function SettingsTab({ app, api }) {
 
 function DashboardWidget({ api }) {
   const [data, setData] = useState(null)
+  const [loadError, setLoadError] = useState(null)
 
-  useEffect(() => {
-    (async () => {
+  const load = useCallback(async () => {
+      setLoadError(null)
       try {
         const [products, levels, warehouses] = await Promise.all([
           api.products.list(), api.movements.levels(), api.warehouses.list(),
@@ -3140,10 +3179,11 @@ function DashboardWidget({ api }) {
           levels: Array.isArray(levels) ? levels : [],
           warehouses: Array.isArray(warehouses) ? warehouses : [],
         })
-      } catch (e) {}
-    })()
+      } catch (e) { setLoadError(classifyError(e)) }
   }, [])
+  useEffect(() => { load() }, [load])
 
+  if (loadError) return React.createElement(ScreenState, { failure: loadError, onRetry: load })
   if (!data) return Spinner()
 
   const totalStock = data.levels.reduce((s, l) => s + (l.availableQuantity ?? 0), 0)
