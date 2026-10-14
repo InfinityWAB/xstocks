@@ -1,9 +1,17 @@
 import { definePlugin } from '@infintywab/plugin-sdk'
+import { isLowStock, lowStockProducts, quantityByProduct, stockValue as computeStockValue, warehouseStats } from './lib/stockMetrics.js'
+import { fetchAllPages, truncationNotice } from './lib/pagination.js'
+import { screenKind, classifyError, SCREEN_MESSAGES } from './lib/screenState.js'
+import { STOCK_ACCESS_PERMISSION } from './lib/permissions.js'
 
 const BASE = '/app/xstock'
 const modalRoot = document.getElementById('modal-root') || document.body
 const rt = window.__ERP_RUNTIME__ ?? {}
 const { createPortal } = rt.ReactDOM ?? window.ReactDOM ?? {}
+
+// Le backend plafonne à 50 par défaut (100 mouvements) et ne renvoie ni total ni
+// has_more : on pagine jusqu'à une page incomplète (5 000 lignes max par liste).
+const PAGING = { pageSize: 200, maxPages: 25 }
 
 function qs(params = {}) {
   const q = new URLSearchParams()
@@ -18,6 +26,8 @@ function api(app) {
   return {
     products: {
       list:     (p) => app.apiGet(`${BASE}/products/${qs(p)}`),
+      // Tout le catalogue, page par page ; { items, truncated } (voir lib/pagination.js).
+      listAll:  () => fetchAllPages((q) => app.apiGet(`${BASE}/products/${qs(q)}`), { ...PAGING, key: (x) => x.id }),
       get:      (id) => app.apiGet(`${BASE}/products/${id}`),
       create:   (b) => app.apiPost(`${BASE}/products/`, b),
       update:   (id, b) => app.apiPatch(`${BASE}/products/${id}`, b),
@@ -25,6 +35,7 @@ function api(app) {
     },
     warehouses: {
       list:     (p) => app.apiGet(`${BASE}/warehouses/${qs(p)}`),
+      listAll:  () => fetchAllPages((q) => app.apiGet(`${BASE}/warehouses/${qs(q)}`), { ...PAGING, key: (x) => x.id }),
       get:      (id) => app.apiGet(`${BASE}/warehouses/${id}`),
       create:   (b) => app.apiPost(`${BASE}/warehouses/`, b),
       update:   (id, b) => app.apiPatch(`${BASE}/warehouses/${id}`, b),
@@ -33,6 +44,8 @@ function api(app) {
     },
     movements: {
       list:     (p) => app.apiGet(`${BASE}/movements/${qs(p)}`),
+      // Journal : borné à 5 pages (1 000 mouvements les plus récents) ; le reste est signalé.
+      listAll:  () => fetchAllPages((q) => app.apiGet(`${BASE}/movements/${qs(q)}`), { pageSize: 200, maxPages: 5, key: (x) => x.id }),
       byProduct: (id) => app.apiGet(`${BASE}/movements/by-product/${id}`),
       receive:  (b) => app.apiPost(`${BASE}/movements/receive`, b),
       issue:    (b) => app.apiPost(`${BASE}/movements/issue`, b),
@@ -52,6 +65,7 @@ function api(app) {
     transfers: {
       create:   (b) => app.apiPost(`${BASE}/transfers/`, b),
       list:     () => app.apiGet(`${BASE}/transfers/`),
+      listAll:  () => fetchAllPages((q) => app.apiGet(`${BASE}/transfers/${qs(q)}`), { ...PAGING, key: (x) => x.id }),
       lines:    (id) => app.apiGet(`${BASE}/transfers/${id}/lines`),
       ready:    (id) => app.apiPost(`${BASE}/transfers/${id}/ready`, {}),
       execute:  (id) => app.apiPost(`${BASE}/transfers/${id}/execute`, {}),
@@ -709,6 +723,33 @@ function EmptyState({ icon, title, hint, action }) {
   )
 }
 
+// Bandeau « affichage limité » : la liste affichée n'est pas complète, on le dit.
+function limitNotes(...parts) {
+  return parts.map(([r, noun]) => truncationNotice(r.items.length, r.truncated, noun)).filter(Boolean)
+}
+function LimitNotice({ notes }) {
+  if (!notes || notes.length === 0) return null
+  return React.createElement('div', { role: 'status', style: { padding: '8px 12px', borderRadius: 8, fontSize: 12,
+    background: 'var(--color-warning-subtle, #fff7e0)', color: 'var(--color-text-secondary)' } }, notes.join(' '))
+}
+
+// État d'écran d'une liste qui n'a pas pu se charger : message clair + « Réessayer ».
+// `failure` = résultat de classifyError(). Distinct d'EmptyState (« aucune donnée »).
+function ScreenState({ failure, onRetry }) {
+  const kind = screenKind({ error: failure?.error, offline: failure?.offline, forbidden: failure?.forbidden, data: [] })
+  if (kind !== 'error' && kind !== 'offline' && kind !== 'forbidden') return null
+  const m = SCREEN_MESSAGES[kind]
+  return React.createElement('div', {
+    role: kind === 'error' ? 'alert' : 'status',
+    style: { display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8, padding: '56px 24px', textAlign: 'center' },
+  },
+    React.createElement('div', { style: { fontWeight: 700, color: 'var(--color-danger)', fontSize: 14 } }, m.title),
+    React.createElement('div', { style: { fontSize: 12, color: 'var(--color-text-tertiary)', maxWidth: 420 } }, m.message),
+    failure?.error && kind === 'error' && React.createElement('div', { style: { fontSize: 11, color: 'var(--color-text-tertiary)' } }, `Détail : ${failure.error}`),
+    kind !== 'forbidden' && onRetry && React.createElement('button', { style: { ...S.btnPrimary, marginTop: 8 }, onClick: onRetry }, 'Réessayer'),
+  )
+}
+
 /* ════════════════════════════════════════════════════════════════════════
    PRODUCTS TAB
    ════════════════════════════════════════════════════════════════════════ */
@@ -718,6 +759,8 @@ function ProductsTab({ app, api, onNavigate }) {
   const [warehouses, setWarehouses] = useState([])
   const [levels, setLevels] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
+  const [limited, setLimited] = useState([])
   const [search, setSearch] = useState('')
   const [categoryFilter, setCategoryFilter] = useState('all')
   const [statusFilter, setStatusFilter] = useState('active')
@@ -741,9 +784,9 @@ function ProductsTab({ app, api, onNavigate }) {
   const load = useCallback(async (silent) => {
     if (!silent) setLoading(true)
     try {
-      const [p, w, l] = await Promise.all([api.products.list(), api.warehouses.list(), api.movements.levels()])
-      setProducts(p ?? []); setWarehouses(w ?? []); setLevels(l ?? [])
-    } catch (e) { if (!silent) app.notify('Erreur chargement produits', 'error') }
+      const [p, w, l] = await Promise.all([api.products.listAll(), api.warehouses.listAll(), api.movements.levels()])
+      setProducts(p.items); setWarehouses(w.items); setLevels(l ?? []); setLimited(limitNotes([p, 'produits'], [w, 'entrepôts'])); setLoadError(null)
+    } catch (e) { if (!silent) setLoadError(classifyError(e)) }
     if (!silent) setLoading(false)
   }, [])
 
@@ -753,9 +796,7 @@ function ProductsTab({ app, api, onNavigate }) {
   useEffect(() => app.onRealtime('xstock', () => load(true)), [load])
 
   const stockByProduct = useMemo(() => {
-    const m = new Map()
-    for (const l of levels) m.set(l.productId, (m.get(l.productId) ?? 0) + l.availableQuantity)
-    return m
+    return quantityByProduct(levels)
   }, [levels])
 
   const categories = useMemo(() =>
@@ -764,7 +805,7 @@ function ProductsTab({ app, api, onNavigate }) {
   )
 
   const lowStockCount = useMemo(() =>
-    products.filter(p => p.isActive && p.minThreshold > 0 && (stockByProduct.get(p.id) ?? 0) <= p.minThreshold).length,
+    products.filter(p => isLowStock(p, stockByProduct.get(p.id) ?? 0)).length,
     [products, stockByProduct],
   )
 
@@ -777,8 +818,7 @@ function ProductsTab({ app, api, onNavigate }) {
     return products.filter(p => p.createdAt && new Date(p.createdAt).getTime() >= weekAgo).length
   }, [products])
   const stockValue = useMemo(() => {
-    const purchasePriceById = new Map(products.map(p => [p.id, p.purchasePrice ?? 0]))
-    return levels.reduce((sum, l) => sum + l.availableQuantity * (purchasePriceById.get(l.productId) ?? 0), 0)
+    return computeStockValue(levels, products)
   }, [levels, products])
   const activeWarehouseCount = useMemo(() => warehouses.filter(w => w.isActive).length, [warehouses])
 
@@ -848,7 +888,7 @@ function ProductsTab({ app, api, onNavigate }) {
     let list = products
     if (statusFilter !== 'all') list = list.filter(p => p.isActive === (statusFilter === 'active'))
     if (categoryFilter !== 'all') list = list.filter(p => p.categoryId === categoryFilter)
-    if (lowStockOnly) list = list.filter(p => p.minThreshold > 0 && (stockByProduct.get(p.id) ?? 0) <= p.minThreshold)
+    if (lowStockOnly) list = list.filter(p => isLowStock(p, stockByProduct.get(p.id) ?? 0))
     if (search) {
       const q = search.toLowerCase()
       list = list.filter(p => p.name?.toLowerCase().includes(q) || p.code?.toLowerCase().includes(q))
@@ -943,11 +983,13 @@ function ProductsTab({ app, api, onNavigate }) {
   const productName = deletingId ? products.find(p => p.id === deletingId)?.name : ''
 
   if (loading) return React.createElement(TableSkeleton, { cols: 6 })
+  if (loadError) return React.createElement(ScreenState, { failure: loadError, onRetry: () => load() })
 
   const allVisibleSelected = sorted.length > 0 && sorted.every(p => selected.has(p.id))
   const someVisibleSelected = sorted.some(p => selected.has(p.id))
 
   return React.createElement(Fragment, null,
+    React.createElement(LimitNotice, { notes: limited }),
     React.createElement('div', { style: S.grid4 },
       React.createElement(KpiCard, {
         icon: Icon.package, tint: 'primary', label: 'Produits actifs', value: activeCount.toLocaleString('fr-FR'),
@@ -955,8 +997,8 @@ function ProductsTab({ app, api, onNavigate }) {
         subTint: newThisWeekCount > 0 ? 'success' : undefined,
       }),
       React.createElement(KpiCard, {
-        icon: Icon.trending, tint: 'success', label: 'Valeur du stock', value: stockValue.toLocaleString('fr-FR', { maximumFractionDigits: 0 }),
-        sub: `Sur ${activeWarehouseCount} entrepôt${activeWarehouseCount > 1 ? 's' : ''} actif${activeWarehouseCount > 1 ? 's' : ''}`,
+        icon: Icon.trending, tint: 'success', label: 'Valeur du stock', value: stockValue.value.toLocaleString('fr-FR', { maximumFractionDigits: 0 }),
+        sub: stockValue.unpriced > 0 ? `${stockValue.unpriced} ligne(s) de stock sans coût, non valorisée(s)` : `Sur ${activeWarehouseCount} entrepôt${activeWarehouseCount > 1 ? 's' : ''} actif${activeWarehouseCount > 1 ? 's' : ''}`,
       }),
       React.createElement(KpiCard, {
         icon: Icon.warehouse, tint: 'info', label: 'Entrepôts actifs', value: activeWarehouseCount.toLocaleString('fr-FR'),
@@ -1590,6 +1632,8 @@ function WarehousesTab({ app, api, onNavigate }) {
   const [levels, setLevels] = useState([])
   const [moves, setMoves] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
+  const [limited, setLimited] = useState([])
   const [search, setSearch] = useState('')
   const [detailWarehouse, setDetailWarehouse] = useState(null)
   const [formOpen, setFormOpen] = useState(false)
@@ -1599,30 +1643,16 @@ function WarehousesTab({ app, api, onNavigate }) {
   const load = useCallback(async (silent) => {
     if (!silent) setLoading(true)
     try {
-      const [w, p, l, m] = await Promise.all([api.warehouses.list(), api.products.list(), api.movements.levels(), api.movements.list()])
-      setWarehouses(w ?? []); setProducts(p ?? []); setLevels(l ?? []); setMoves(m ?? [])
-    } catch (e) { if (!silent) app.notify('Erreur chargement', 'error') }
+      const [w, p, l, m] = await Promise.all([api.warehouses.listAll(), api.products.listAll(), api.movements.levels(), api.movements.listAll()])
+      setWarehouses(w.items); setProducts(p.items); setLevels(l ?? []); setMoves(m.items); setLimited(limitNotes([w, 'entrepôts'], [p, 'produits'], [m, 'mouvements'])); setLoadError(null)
+    } catch (e) { if (!silent) setLoadError(classifyError(e)) }
     if (!silent) setLoading(false)
   }, [])
 
   useEffect(() => { load() }, [load])
   useEffect(() => app.onRealtime('xstock', () => load(true)), [load])
 
-  const statsByWarehouse = useMemo(() => {
-    const productById = new Map(products.map(p => [p.id, p]))
-    const perWh = new Map()
-    for (const l of levels) {
-      if (!(l.availableQuantity > 0)) continue
-      const product = productById.get(l.productId)
-      const stats = perWh.get(l.warehouseId) ?? { skus: new Set(), units: 0, value: 0, alerts: new Set() }
-      stats.skus.add(l.productId)
-      stats.units += l.availableQuantity
-      stats.value += l.availableQuantity * (product?.purchasePrice ?? 0)
-      if (product?.minThreshold > 0 && l.availableQuantity <= product.minThreshold) stats.alerts.add(l.productId)
-      perWh.set(l.warehouseId, stats)
-    }
-    return perWh
-  }, [products, levels])
+  const statsByWarehouse = useMemo(() => warehouseStats(levels, products), [products, levels])
 
   // Tendance 7 jours par entrepôt — dérivée des vrais mouvements (delta de
   // solde jour par jour), affichée en mini-sparkline sur chaque carte.
@@ -1678,10 +1708,12 @@ function WarehousesTab({ app, api, onNavigate }) {
   }, [editingWarehouse, load])
 
   if (loading) return Spinner()
+  if (loadError) return React.createElement(ScreenState, { failure: loadError, onRetry: () => load() })
 
   const emptyStats = { skus: new Set(), units: 0, value: 0, alerts: new Set() }
 
   return React.createElement(Fragment, null,
+    React.createElement(LimitNotice, { notes: limited }),
     React.createElement('div', { style: S.grid4 },
       React.createElement(KpiCard, {
         icon: Icon.warehouse, tint: 'primary', label: 'Entrepôts actifs', value: activeWarehouseCount.toLocaleString('fr-FR'),
@@ -1809,6 +1841,8 @@ function MovementsTab({ app, api }) {
   const [products, setProducts] = useState([])
   const [warehouses, setWarehouses] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
+  const [limited, setLimited] = useState([])
   const [typeFilter, setTypeFilter] = useState('ALL')
   const [formOpen, setFormOpen] = useState(false)
   const [formKind, setFormKind] = useState('receive')
@@ -1819,11 +1853,13 @@ function MovementsTab({ app, api }) {
   const load = useCallback(async (silent) => {
     if (!silent) setLoading(true)
     try {
-      const [m, p, w] = await Promise.all([api.movements.list(), api.products.list(), api.warehouses.list()])
-      setMoves(m ?? [])
-      setProducts(p ?? [])
-      setWarehouses(w ?? [])
-    } catch (e) { if (!silent) app.notify('Erreur chargement', 'error') }
+      const [m, p, w] = await Promise.all([api.movements.listAll(), api.products.listAll(), api.warehouses.listAll()])
+      setMoves(m.items)
+      setProducts(p.items)
+      setWarehouses(w.items)
+      setLimited(limitNotes([m, 'mouvements les plus récents'], [p, 'produits'], [w, 'entrepôts']))
+      setLoadError(null)
+    } catch (e) { if (!silent) setLoadError(classifyError(e)) }
     if (!silent) setLoading(false)
   }, [])
 
@@ -1848,8 +1884,10 @@ function MovementsTab({ app, api }) {
   }, [moves, typeFilter])
 
   if (loading) return React.createElement(TableSkeleton, { cols: 7 })
+  if (loadError) return React.createElement(ScreenState, { failure: loadError, onRetry: () => load() })
 
   return React.createElement(Fragment, null,
+    React.createElement(LimitNotice, { notes: limited }),
     React.createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10 } },
       React.createElement('div', { style: S.tabs },
         [['ALL', 'Tous'], ['in', 'Entrées'], ['out', 'Sorties'], ['transfer', 'Transferts'], ['adjustment', 'Ajustements']].map(([v, l]) =>
@@ -2028,15 +2066,16 @@ const INVENTORY_STATUS_LABELS = {
 function InventoryDetailModal({ app, api, count, onClose, onChanged }) {
   const [lines, setLines] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
   const [savingLineId, setSavingLineId] = useState(null)
   const [overrideReason, setOverrideReason] = useState('')
   const [validating, setValidating] = useState(false)
   const [cancelling, setCancelling] = useState(false)
 
   const load = useCallback(async () => {
-    setLoading(true)
+    setLoading(true); setLoadError(null)
     try { setLines(await api.inventory.lines(count.id) ?? []) }
-    catch (e) { app.notify('Erreur chargement des lignes', 'error') }
+    catch (e) { setLoadError(classifyError(e)) }
     setLoading(false)
   }, [count.id])
 
@@ -2088,7 +2127,9 @@ function InventoryDetailModal({ app, api, count, onClose, onChanged }) {
         React.createElement(Badge, { status: count.status, label: INVENTORY_STATUS_LABELS[count.status] ?? count.status }),
         isOpen && uncounted > 0 && React.createElement('span', { style: { fontSize: 12, color: 'var(--color-text-tertiary)' } }, `${uncounted} ligne(s) non comptée(s)`),
       ),
-      loading
+      loadError
+        ? React.createElement(ScreenState, { failure: loadError, onRetry: load })
+        : loading
         ? React.createElement(TableSkeleton, { rows: 4, cols: 4 })
         : lines.length === 0
           ? React.createElement(EmptyState, { icon: Icon.clipboard, title: 'Aucune ligne', hint: 'Cet inventaire ne contient aucun produit.' })
@@ -2134,6 +2175,7 @@ function InventoryTab({ app, api }) {
   const [counts, setCounts] = useState([])
   const [warehouses, setWarehouses] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
   const [statusFilter, setStatusFilter] = useState('ALL')
   const [formOpen, setFormOpen] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -2144,11 +2186,12 @@ function InventoryTab({ app, api }) {
   const load = useCallback(async (silent) => {
     if (!silent) setLoading(true)
     try {
-      const whs = await api.warehouses.list() ?? []
+      const whsPage = await api.warehouses.listAll()
+      const whs = whsPage.items
       setWarehouses(whs)
-      const perWarehouse = await Promise.all(whs.map(w => api.inventory.byWarehouse(w.id).catch(() => [])))
-      setCounts(perWarehouse.flat())
-    } catch (e) { if (!silent) app.notify('Erreur chargement', 'error') }
+      const perWarehouse = await Promise.all(whs.map(w => api.inventory.byWarehouse(w.id)))
+      setCounts(perWarehouse.flat()); setLoadError(null)
+    } catch (e) { if (!silent) setLoadError(classifyError(e)) }
     if (!silent) setLoading(false)
   }, [])
 
@@ -2182,6 +2225,7 @@ function InventoryTab({ app, api }) {
   }, [load])
 
   if (loading) return React.createElement(TableSkeleton, { cols: 4 })
+  if (loadError) return React.createElement(ScreenState, { failure: loadError, onRetry: () => load() })
 
   return React.createElement(Fragment, null,
     React.createElement('div', { style: S.grid4 },
@@ -2277,11 +2321,12 @@ const TRANSFER_STATUS_LABELS = { draft: 'Brouillon', ready: 'Prêt', done: 'Term
 function TransferDetailModal({ app, api, transfer, onClose, busy, onAction }) {
   const [lines, setLines] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
 
   const load = useCallback(async () => {
-    setLoading(true)
+    setLoading(true); setLoadError(null)
     try { setLines(await api.transfers.lines(transfer.id) ?? []) }
-    catch (e) { app.notify('Erreur chargement des lignes', 'error') }
+    catch (e) { setLoadError(classifyError(e)) }
     setLoading(false)
   }, [transfer.id])
 
@@ -2298,7 +2343,9 @@ function TransferDetailModal({ app, api, transfer, onClose, busy, onAction }) {
         React.createElement(Badge, { status: transfer.status, label: TRANSFER_STATUS_LABELS[transfer.status] ?? transfer.status }),
         React.createElement('span', { style: { fontSize: 12, color: 'var(--color-text-tertiary)' } }, `Créé par ${transfer.createdBy}`),
       ),
-      loading
+      loadError
+        ? React.createElement(ScreenState, { failure: loadError, onRetry: load })
+        : loading
         ? React.createElement(TableSkeleton, { rows: 4, cols: 3 })
         : lines.length === 0
           ? React.createElement(EmptyState, { icon: Icon.arrows, title: 'Aucune ligne', hint: 'Ce transfert ne contient aucun produit.' })
@@ -2332,6 +2379,8 @@ function TransfersTab({ app, api }) {
   const [warehouses, setWarehouses] = useState([])
   const [products, setProducts] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
+  const [limited, setLimited] = useState([])
   const [statusFilter, setStatusFilter] = useState('ALL')
   const [formOpen, setFormOpen] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -2341,9 +2390,9 @@ function TransfersTab({ app, api }) {
   const load = useCallback(async (silent) => {
     if (!silent) setLoading(true)
     try {
-      const [t, w, p] = await Promise.all([api.transfers.list(), api.warehouses.list(), api.products.list()])
-      setTransfers(t ?? []); setWarehouses(w ?? []); setProducts(p ?? [])
-    } catch (e) { if (!silent) app.notify('Erreur chargement', 'error') }
+      const [t, w, p] = await Promise.all([api.transfers.listAll(), api.warehouses.listAll(), api.products.listAll()])
+      setTransfers(t.items); setWarehouses(w.items); setProducts(p.items); setLimited(limitNotes([t, 'transferts'], [w, 'entrepôts'], [p, 'produits'])); setLoadError(null)
+    } catch (e) { if (!silent) setLoadError(classifyError(e)) }
     if (!silent) setLoading(false)
   }, [])
 
@@ -2381,8 +2430,10 @@ function TransfersTab({ app, api }) {
   const cancelledCount = useMemo(() => transfers.filter(t => t.status === 'cancelled').length, [transfers])
 
   if (loading) return React.createElement(TableSkeleton, { cols: 6 })
+  if (loadError) return React.createElement(ScreenState, { failure: loadError, onRetry: () => load() })
 
   return React.createElement(Fragment, null,
+    React.createElement(LimitNotice, { notes: limited }),
     React.createElement('div', { style: S.grid4 },
       React.createElement(KpiCard, { icon: Icon.arrows, tint: 'primary', label: 'Transferts', value: transfers.length.toLocaleString('fr-FR'), sub: 'Tous statuts confondus' }),
       React.createElement(KpiCard, {
@@ -2523,6 +2574,8 @@ function IntelligenceTab({ app, api }) {
   const [products, setProducts] = useState([])
   const [warehouses, setWarehouses] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
+  const [limited, setLimited] = useState([])
 
   const [suggestions, setSuggestions] = useState([])
   const [suggestionsBusy, setSuggestionsBusy] = useState(false)
@@ -2542,16 +2595,15 @@ function IntelligenceTab({ app, api }) {
   const [classification, setClassification] = useState(null)
   const [classifyBusy, setClassifyBusy] = useState(false)
 
-  useEffect(() => {
-    (async () => {
-      setLoading(true)
+  const loadInitial = useCallback(async () => {
+      setLoading(true); setLoadError(null)
       try {
-        const [p, w, s] = await Promise.all([api.products.list(), api.warehouses.list(), api.intelligence.pendingSuggestions()])
-        setProducts(p ?? []); setWarehouses(w ?? []); setSuggestions(s ?? [])
-      } catch (e) { app.notify('Erreur chargement', 'error') }
+        const [p, w, s] = await Promise.all([api.products.listAll(), api.warehouses.listAll(), api.intelligence.pendingSuggestions()])
+        setProducts(p.items); setWarehouses(w.items); setSuggestions(s ?? []); setLimited(limitNotes([p, 'produits'], [w, 'entrepôts']))
+      } catch (e) { setLoadError(classifyError(e)) }
       setLoading(false)
-    })()
   }, [])
+  useEffect(() => { loadInitial() }, [loadInitial])
 
   const productName = useCallback((id) => products.find(p => p.id === id)?.name ?? id, [products])
 
@@ -2606,8 +2658,10 @@ function IntelligenceTab({ app, api }) {
   }, [])
 
   if (loading) return Spinner()
+  if (loadError) return React.createElement(ScreenState, { failure: loadError, onRetry: loadInitial })
 
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 20 } },
+    React.createElement(LimitNotice, { notes: limited }),
 
     // ── Suggestions de transfert ──────────────────────────────────
     React.createElement('div', { style: { ...S.card, padding: 20 } },
@@ -2758,6 +2812,8 @@ function AttachmentsTab({ app, api }) {
   const [products, setProducts] = useState([])
   const [warehouses, setWarehouses] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
+  const [limited, setLimited] = useState([])
   const [ownerType, setOwnerType] = useState('product')
   const [ownerId, setOwnerId] = useState('')
   const [attachments, setAttachments] = useState(null)
@@ -2765,16 +2821,15 @@ function AttachmentsTab({ app, api }) {
   const [uploading, setUploading] = useState(false)
   const [busyId, setBusyId] = useState(null)
 
-  useEffect(() => {
-    (async () => {
-      setLoading(true)
+  const loadInitial = useCallback(async () => {
+      setLoading(true); setLoadError(null)
       try {
-        const [p, w] = await Promise.all([api.products.list(), api.warehouses.list()])
-        setProducts(p ?? []); setWarehouses(w ?? [])
-      } catch (e) { app.notify('Erreur chargement', 'error') }
+        const [p, w] = await Promise.all([api.products.listAll(), api.warehouses.listAll()])
+        setProducts(p.items); setWarehouses(w.items); setLimited(limitNotes([p, 'produits'], [w, 'entrepôts']))
+      } catch (e) { setLoadError(classifyError(e)) }
       setLoading(false)
-    })()
   }, [])
+  useEffect(() => { loadInitial() }, [loadInitial])
 
   const loadAttachments = useCallback(async () => {
     if (!ownerId) return app.notify('Sélectionner ou saisir un identifiant', 'warning')
@@ -2813,8 +2868,10 @@ function AttachmentsTab({ app, api }) {
   }, [])
 
   if (loading) return Spinner()
+  if (loadError) return React.createElement(ScreenState, { failure: loadError, onRetry: loadInitial })
 
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 20 } },
+    React.createElement(LimitNotice, { notes: limited }),
     React.createElement('div', { style: { ...S.card, padding: 20 } },
       React.createElement('div', { style: { display: 'flex', gap: 10, alignItems: 'flex-end', flexWrap: 'wrap' } },
         React.createElement('div', { style: { minWidth: 200 } },
@@ -2991,13 +3048,13 @@ function SettingsTab({ app, api }) {
   const [alerts, setAlerts] = useState([])
   const [members, setMembers] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
   const [targetingOpen, setTargetingOpen] = useState(false)
   const [targetingEdit, setTargetingEdit] = useState(null)
   const [savingTargeting, setSavingTargeting] = useState(false)
 
-  useEffect(() => {
-    (async () => {
-      setLoading(true)
+  const loadInitial = useCallback(async () => {
+      setLoading(true); setLoadError(null)
       try {
         const [s, a, m] = await Promise.all([api.settings.get(), api.settings.alerts(), api.settings.members()])
         setSettings(s ?? {})
@@ -3006,10 +3063,10 @@ function SettingsTab({ app, api }) {
         // aux schémas xstock) — normalise ici pour rester cohérent avec le
         // reste du fichier qui suppose du camelCase partout.
         setMembers((Array.isArray(m) ? m : []).map(x => ({ userId: x.user_id, email: x.email, roleId: x.role_id })))
-      } catch (e) { app.notify('Erreur chargement paramètres', 'error') }
+      } catch (e) { setLoadError(classifyError(e)) }
       setLoading(false)
-    })()
   }, [])
+  useEffect(() => { loadInitial() }, [loadInitial])
 
   const update = useCallback(async (patch) => {
     try {
@@ -3053,6 +3110,7 @@ function SettingsTab({ app, api }) {
   const creatableTypes = useMemo(() => ACTIVE_ALERT_TYPES.filter(t => !configuredTypes.has(t)), [configuredTypes])
 
   if (loading) return Spinner()
+  if (loadError) return React.createElement(ScreenState, { failure: loadError, onRetry: loadInitial })
 
   return React.createElement(Fragment, null,
     React.createElement('div', { style: S.grid2 },
@@ -3128,29 +3186,35 @@ function SettingsTab({ app, api }) {
 
 function DashboardWidget({ api }) {
   const [data, setData] = useState(null)
+  const [loadError, setLoadError] = useState(null)
+  const [limited, setLimited] = useState([])
 
-  useEffect(() => {
-    (async () => {
+  const load = useCallback(async () => {
+      setLoadError(null)
       try {
         const [products, levels, warehouses] = await Promise.all([
-          api.products.list(), api.movements.levels(), api.warehouses.list(),
+          api.products.listAll(), api.movements.levels(), api.warehouses.listAll(),
         ])
         setData({
-          products: Array.isArray(products) ? products : [],
+          products: products.items,
           levels: Array.isArray(levels) ? levels : [],
-          warehouses: Array.isArray(warehouses) ? warehouses : [],
+          warehouses: warehouses.items,
         })
-      } catch (e) {}
-    })()
+        setLimited(limitNotes([products, 'produits'], [warehouses, 'entrepôts']))
+      } catch (e) { setLoadError(classifyError(e)) }
   }, [])
+  useEffect(() => { load() }, [load])
 
+  if (loadError) return React.createElement(ScreenState, { failure: loadError, onRetry: load })
   if (!data) return Spinner()
 
   const totalStock = data.levels.reduce((s, l) => s + (l.availableQuantity ?? 0), 0)
-  const lowStock = data.products.filter(p => p.minThreshold != null && p.minThreshold > 0).length
+  const lowStock = lowStockProducts(data.products, data.levels).length
   const activeWarehouses = data.warehouses.filter(w => w.isActive).length
 
-  return React.createElement('div', { style: S.grid4 },
+  return React.createElement(Fragment, null,
+    React.createElement(LimitNotice, { notes: limited }),
+  React.createElement('div', { style: S.grid4 },
     React.createElement('div', { style: S.kpi },
       React.createElement('div', { style: S.kpiLabel }, 'Produits'),
       React.createElement('div', { style: S.kpiValue }, data.products.length.toLocaleString('fr-FR')),
@@ -3167,6 +3231,7 @@ function DashboardWidget({ api }) {
       React.createElement('div', { style: S.kpiLabel }, 'Entrepôts'),
       React.createElement('div', { style: S.kpiValue }, activeWarehouses.toLocaleString('fr-FR')),
     ),
+  ),
   )
 }
 
@@ -3334,10 +3399,10 @@ export default definePlugin((app) => {
   const a = api(app)
   app.registerRoutes([
     { path: '/stock', component: () => React.createElement(StockPage, { app, api: a, tab: currentTab }),
-      meta: { title: app.t('stock.name'), permission: 'stock:products:read' } },
+      meta: { title: app.t('stock.name'), permission: STOCK_ACCESS_PERMISSION } },
   ])
   app.registerSidebar([
-    { label: app.t('stock.name'), path: '/stock', icon: 'package', section: 'Opérations', order: 10, permission: 'stock:products:read' },
+    { label: app.t('stock.name'), path: '/stock', icon: 'package', section: 'Opérations', order: 10, permission: STOCK_ACCESS_PERMISSION },
   ])
   app.registerDashboardWidget({
     id: 'stock.overview', title: 'Aperçu Stock', component: () => React.createElement(DashboardWidget, { api: a }), defaultSize: 'md',
