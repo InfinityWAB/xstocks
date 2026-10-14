@@ -3,6 +3,7 @@ import { isLowStock, lowStockProducts, quantityByProduct, stockValue as computeS
 import { fetchAllPages, truncationNotice } from './lib/pagination.js'
 import { screenKind, classifyError, SCREEN_MESSAGES } from './lib/screenState.js'
 import { STOCK_ACCESS_PERMISSION } from './lib/permissions.js'
+import { lowStockSummary, lowStockTodoRows, movementsTrend } from './lib/dashboardWidgets.js'
 
 const BASE = '/app/xstock'
 const modalRoot = document.getElementById('modal-root') || document.body
@@ -3235,6 +3236,13 @@ function DashboardWidget({ api }) {
   )
 }
 
+// Repli d'un widget générique rendu par un hôte sans cadre : une ligne de texte.
+function Fallback({ text }) {
+  const [out, setOut] = useState('…')
+  useEffect(() => { Promise.resolve(text()).then(setOut, () => setOut('Données indisponibles')) }, [])
+  return React.createElement('div', { style: S.subtitle }, out)
+}
+
 /* ════════════════════════════════════════════════════════════════════════
    MAIN PAGE
    ════════════════════════════════════════════════════════════════════════ */
@@ -3406,6 +3414,46 @@ export default definePlugin((app) => {
   ])
   app.registerDashboardWidget({
     id: 'stock.overview', title: 'Aperçu Stock', component: () => React.createElement(DashboardWidget, { api: a }), defaultSize: 'md',
+  })
+  // Widgets du contrat générique du tableau de bord (lecture seule, sans coût ni valeur).
+  // Ils partagent une lecture produits+niveaux (cache de 15 s) ; une erreur est
+  // propagée telle quelle : le cadre affiche chargement / erreur / hors ligne.
+  let snap = null
+  const snapshot = () => {
+    if (!snap || Date.now() - snap.at > 15000) {
+      const p = Promise.all([a.products.listAll(), a.movements.levels()])
+        .then(([products, levels]) => ({ products: products.items, levels: Array.isArray(levels) ? levels : [] }))
+      snap = { at: Date.now(), p }
+      p.catch(() => { if (snap && snap.p === p) snap = null })
+    }
+    return snap.p
+  }
+  const loadLow = async () => {
+    const { products, levels } = await snapshot()
+    const s = lowStockSummary(products, levels)
+    return { label: 'Stock bas', value: s.value, unit: s.unit, state: s.state, hint: s.hint, detailRoute: '/stock' }
+  }
+  const loadTodo = async () => { const { products, levels } = await snapshot(); return lowStockTodoRows(products, levels) }
+  const loadTrend = async () => {
+    const moves = await a.movements.listAll()
+    return movementsTrend(moves.items, new Date(), { truncated: moves.truncated })
+  }
+  // Repli minimal pour un hôte sans cadre générique : une ligne de texte.
+  const fb = (text) => () => React.createElement(Fallback, { text })
+  app.registerDashboardWidget({
+    id: 'stock.low', title: 'Stock bas', defaultSize: 'sm',
+    component: fb(async () => { const d = await loadLow(); return `Stock bas : ${d.value} ${d.unit}` }),
+    generic: { kind: 'indicator', priority: 20, requiredRight: STOCK_ACCESS_PERMISSION, load: loadLow },
+  })
+  app.registerDashboardWidget({
+    id: 'stock.todo', title: 'Stock à réapprovisionner', defaultSize: 'md',
+    component: fb(async () => `${(await loadTodo()).length} produit(s) à traiter`),
+    generic: { kind: 'todo', priority: 20, requiredRight: STOCK_ACCESS_PERMISSION, load: loadTodo },
+  })
+  app.registerDashboardWidget({
+    id: 'stock.trend', title: 'Mouvements de stock', defaultSize: 'md',
+    component: fb(async () => { const t = await loadTrend(); return t.value ? `${t.value} ${t.unit} sur 14 jours` : 'Pas assez de mouvements' }),
+    generic: { kind: 'trend', priority: 20, requiredRight: STOCK_ACCESS_PERMISSION, load: loadTrend },
   })
   app.registerCommand({
     id: 'stock.open', label: app.t('stock.name'), icon: 'package', run: () => app.navigate('/stock'),
