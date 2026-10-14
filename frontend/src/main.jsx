@@ -1,4 +1,5 @@
 import { definePlugin } from '@infintywab/plugin-sdk'
+import { isLowStock, lowStockProducts, quantityByProduct, stockValue as computeStockValue, warehouseStats } from './lib/stockMetrics.js'
 import { fetchAllPages, truncationNotice } from './lib/pagination.js'
 import { screenKind, classifyError, SCREEN_MESSAGES } from './lib/screenState.js'
 
@@ -794,9 +795,7 @@ function ProductsTab({ app, api, onNavigate }) {
   useEffect(() => app.onRealtime('xstock', () => load(true)), [load])
 
   const stockByProduct = useMemo(() => {
-    const m = new Map()
-    for (const l of levels) m.set(l.productId, (m.get(l.productId) ?? 0) + l.availableQuantity)
-    return m
+    return quantityByProduct(levels)
   }, [levels])
 
   const categories = useMemo(() =>
@@ -805,7 +804,7 @@ function ProductsTab({ app, api, onNavigate }) {
   )
 
   const lowStockCount = useMemo(() =>
-    products.filter(p => p.isActive && p.minThreshold > 0 && (stockByProduct.get(p.id) ?? 0) <= p.minThreshold).length,
+    products.filter(p => isLowStock(p, stockByProduct.get(p.id) ?? 0)).length,
     [products, stockByProduct],
   )
 
@@ -818,8 +817,7 @@ function ProductsTab({ app, api, onNavigate }) {
     return products.filter(p => p.createdAt && new Date(p.createdAt).getTime() >= weekAgo).length
   }, [products])
   const stockValue = useMemo(() => {
-    const purchasePriceById = new Map(products.map(p => [p.id, p.purchasePrice ?? 0]))
-    return levels.reduce((sum, l) => sum + l.availableQuantity * (purchasePriceById.get(l.productId) ?? 0), 0)
+    return computeStockValue(levels, products)
   }, [levels, products])
   const activeWarehouseCount = useMemo(() => warehouses.filter(w => w.isActive).length, [warehouses])
 
@@ -889,7 +887,7 @@ function ProductsTab({ app, api, onNavigate }) {
     let list = products
     if (statusFilter !== 'all') list = list.filter(p => p.isActive === (statusFilter === 'active'))
     if (categoryFilter !== 'all') list = list.filter(p => p.categoryId === categoryFilter)
-    if (lowStockOnly) list = list.filter(p => p.minThreshold > 0 && (stockByProduct.get(p.id) ?? 0) <= p.minThreshold)
+    if (lowStockOnly) list = list.filter(p => isLowStock(p, stockByProduct.get(p.id) ?? 0))
     if (search) {
       const q = search.toLowerCase()
       list = list.filter(p => p.name?.toLowerCase().includes(q) || p.code?.toLowerCase().includes(q))
@@ -998,8 +996,8 @@ function ProductsTab({ app, api, onNavigate }) {
         subTint: newThisWeekCount > 0 ? 'success' : undefined,
       }),
       React.createElement(KpiCard, {
-        icon: Icon.trending, tint: 'success', label: 'Valeur du stock', value: stockValue.toLocaleString('fr-FR', { maximumFractionDigits: 0 }),
-        sub: `Sur ${activeWarehouseCount} entrepôt${activeWarehouseCount > 1 ? 's' : ''} actif${activeWarehouseCount > 1 ? 's' : ''}`,
+        icon: Icon.trending, tint: 'success', label: 'Valeur du stock', value: stockValue.value.toLocaleString('fr-FR', { maximumFractionDigits: 0 }),
+        sub: stockValue.unpriced > 0 ? `${stockValue.unpriced} ligne(s) de stock sans coût, non valorisée(s)` : `Sur ${activeWarehouseCount} entrepôt${activeWarehouseCount > 1 ? 's' : ''} actif${activeWarehouseCount > 1 ? 's' : ''}`,
       }),
       React.createElement(KpiCard, {
         icon: Icon.warehouse, tint: 'info', label: 'Entrepôts actifs', value: activeWarehouseCount.toLocaleString('fr-FR'),
@@ -1653,21 +1651,7 @@ function WarehousesTab({ app, api, onNavigate }) {
   useEffect(() => { load() }, [load])
   useEffect(() => app.onRealtime('xstock', () => load(true)), [load])
 
-  const statsByWarehouse = useMemo(() => {
-    const productById = new Map(products.map(p => [p.id, p]))
-    const perWh = new Map()
-    for (const l of levels) {
-      if (!(l.availableQuantity > 0)) continue
-      const product = productById.get(l.productId)
-      const stats = perWh.get(l.warehouseId) ?? { skus: new Set(), units: 0, value: 0, alerts: new Set() }
-      stats.skus.add(l.productId)
-      stats.units += l.availableQuantity
-      stats.value += l.availableQuantity * (product?.purchasePrice ?? 0)
-      if (product?.minThreshold > 0 && l.availableQuantity <= product.minThreshold) stats.alerts.add(l.productId)
-      perWh.set(l.warehouseId, stats)
-    }
-    return perWh
-  }, [products, levels])
+  const statsByWarehouse = useMemo(() => warehouseStats(levels, products), [products, levels])
 
   // Tendance 7 jours par entrepôt — dérivée des vrais mouvements (delta de
   // solde jour par jour), affichée en mini-sparkline sur chaque carte.
@@ -3224,7 +3208,7 @@ function DashboardWidget({ api }) {
   if (!data) return Spinner()
 
   const totalStock = data.levels.reduce((s, l) => s + (l.availableQuantity ?? 0), 0)
-  const lowStock = data.products.filter(p => p.minThreshold != null && p.minThreshold > 0).length
+  const lowStock = lowStockProducts(data.products, data.levels).length
   const activeWarehouses = data.warehouses.filter(w => w.isActive).length
 
   return React.createElement(Fragment, null,
