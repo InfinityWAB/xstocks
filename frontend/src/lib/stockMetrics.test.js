@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { isLowStock, lowStockProducts, stockValue, quantityByProduct, warehouseStats } from './stockMetrics.js'
+import { isLowStock, lowStockProducts, stockValue, quantityByProduct, warehouseStats, resolveCostsHidden } from './stockMetrics.js'
 
 const P = (o) => ({ id: 'p', isActive: true, minThreshold: 10, purchasePrice: 2, ...o })
 
@@ -53,4 +53,38 @@ test('par entrepôt : cumul des lots, alerte par entrepôt, valeur', () => {
   assert.equal(m.get('w2').alerts.size, 0)
   assert.deepEqual([...m.get('w3').alerts], ['a'])   // niveau à 0 = bas, comme le serveur
   assert.equal(m.get('w3').skus.size, 0)
+})
+
+// ── Coûts masqués (sans costs:read : coûts à null) ───────────────────────────
+const LV = (productId, q, o = {}) => ({ productId, warehouseId: 'w1', availableQuantity: q, averageCost: null, ...o })
+
+test('stockValue : coûts masqués -> null, jamais 0 ni somme partielle', () => {
+  const r = stockValue([LV('a', 5)], [P({ id: 'a', purchasePrice: null })], { costsHidden: true })
+  assert.equal(r.value, null)
+  assert.equal(r.hidden, true)
+  assert.equal(r.unpriced, 0)
+})
+test('stockValue : comportement inchangé quand les coûts sont visibles', () => {
+  const r = stockValue([LV('a', 5), LV('b', 2)], [P({ id: 'a' }), P({ id: 'b', purchasePrice: null })])
+  assert.deepEqual(r, { value: 10, unpriced: 1 })
+})
+test('warehouseStats : valeur null si masqué, quantités intactes', () => {
+  const m = warehouseStats([LV('a', 5)], [P({ id: 'a', purchasePrice: null })], { costsHidden: true })
+  const st = m.get('w1')
+  assert.equal(st.value, null)
+  assert.equal(st.units, 5)
+  assert.equal(st.skus.size, 1)
+})
+test('warehouseStats : valeur numérique sans option', () => {
+  assert.equal(warehouseStats([LV('a', 5)], [P({ id: 'a' })]).get('w1').value, 10)
+})
+test('resolveCostsHidden : app.can fait foi, sinon déduit des null du contrat', () => {
+  const masked = [P({ id: 'a', purchasePrice: null })]
+  assert.equal(resolveCostsHidden({ can: () => false }, [P()], []), true)
+  assert.equal(resolveCostsHidden({ can: () => true }, masked, [LV('a', 1)]), false)
+  assert.equal(resolveCostsHidden({}, masked, [LV('a', 1)]), true)
+  assert.equal(resolveCostsHidden({}, [P()], []), false)
+  assert.equal(resolveCostsHidden({}, [], []), false)
+  assert.equal(resolveCostsHidden({}, [P({ id: 'a', purchasePrice: undefined })], []), false)
+  assert.equal(resolveCostsHidden({}, masked, [LV('a', 1, { averageCost: 3 })]), false)
 })

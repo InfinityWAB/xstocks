@@ -24,7 +24,7 @@ export type Product = {
   name: string
   categoryId?: string
   unit: string
-  purchasePrice?: number
+  purchasePrice?: number | null
   salePrice?: number
   valuationMethod: ValuationMethod
   isLotTracked: boolean
@@ -74,8 +74,8 @@ export type StockMove = {
   warehouseId: string
   sourceLocationId?: string
   destinationLocationId?: string
-  unitCost?: number
-  totalValue?: number
+  unitCost?: number | null
+  totalValue?: number | null
   balanceBefore: number
   balanceAfter: number
   sourceReference?: string
@@ -93,7 +93,7 @@ export type StockLevel = {
   batchId?: string
   availableQuantity: number
   reservedQuantity: number
-  averageCost?: number
+  averageCost?: number | null
 }
 
 export type StockTransferLine = {
