@@ -57,10 +57,14 @@ export function costsDenied(app) {
   }
 }
 
-/** Erreur 403 renvoyée par une action dont l'objet est le coût. */
-export function costActionMessage(e) {
+/**
+ * Erreur 403 d'une action dont l'objet est le coût : message lisible, sauf si l'utilisateur
+ * a le droit (`app.can` vrai) : le refus a alors une autre cause, on ne ment pas.
+ */
+export function costActionMessage(e, app) {
   const status = Number(e?.status ?? e?.statusCode ?? e?.response?.status) || undefined
   const code = String(e?.code ?? '').toUpperCase()
-  if (status === 403 || code === 'FORBIDDEN' || code === 'PERMISSION_DENIED') return COST_ACTION_DENIED
-  return null
+  if (status !== 403 && code !== 'FORBIDDEN' && code !== 'PERMISSION_DENIED') return null
+  try { if (typeof app?.can === 'function' && app.can(COST_PERMISSION) === true) return null } catch { /* inconnu : on suppose le droit manquant */ }
+  return COST_ACTION_DENIED
 }

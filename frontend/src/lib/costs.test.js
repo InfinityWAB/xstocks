@@ -50,3 +50,8 @@ test('costActionMessage : 403 -> message lisible, 500/réseau -> null', () => {
   assert.equal(costActionMessage(new Error('Failed to fetch')), null)
   assert.equal(costActionMessage(null), null)
 })
+test('costActionMessage : 403 alors que le droit est présent -> pas de faux message', () => {
+  assert.equal(costActionMessage({ status: 403 }, { can: () => true }), null)
+  assert.equal(costActionMessage({ status: 403 }, { can: () => false }), COST_ACTION_DENIED)
+  assert.equal(costActionMessage({ status: 403 }, { can: () => { throw new Error('x') } }), COST_ACTION_DENIED)
+})
