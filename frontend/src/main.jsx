@@ -1,5 +1,6 @@
 import { definePlugin } from '@infintywab/plugin-sdk'
-import { isLowStock, lowStockProducts, quantityByProduct, stockValue as computeStockValue, warehouseStats } from './lib/stockMetrics.js'
+import { isLowStock, lowStockProducts, quantityByProduct, stockValue as computeStockValue, warehouseStats, resolveCostsHidden } from './lib/stockMetrics.js'
+import { formatMaybeCost, sumOrNull, hasCost, costsDenied, COST_MASKED_HINT } from './lib/costs.js'
 import { fetchAllPages, truncationNotice } from './lib/pagination.js'
 import { screenKind, classifyError, SCREEN_MESSAGES } from './lib/screenState.js'
 import { STOCK_ACCESS_PERMISSION } from './lib/permissions.js'
@@ -494,7 +495,7 @@ const DotBadge = ({ status, label }) => {
 
 /* ─── KPI card ─────────────────────────────────────────────────────────── */
 
-function KpiCard({ icon, tint, label, value, sub, subTint, onClick }) {
+function KpiCard({ icon, tint, label, value, sub, subTint, onClick, valueTitle }) {
   return React.createElement('div', {
     className: onClick ? 'xstock-kpi-clickable' : undefined,
     style: { ...S.card, padding: 18, display: 'flex', flexDirection: 'column', gap: 12, position: 'relative',
@@ -511,7 +512,7 @@ function KpiCard({ icon, tint, label, value, sub, subTint, onClick }) {
     }, React.createElement(icon, { size: 15 })),
     React.createElement('div', null,
       React.createElement('div', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--color-text-tertiary)', marginBottom: 4 } }, label),
-      React.createElement('div', { style: { fontSize: 22, fontWeight: 800, color: 'var(--color-text-primary)' } }, value),
+      React.createElement('div', { title: valueTitle, style: { fontSize: 22, fontWeight: 800, color: 'var(--color-text-primary)' } }, value),
     ),
     sub && React.createElement('div', { style: { fontSize: 12, color: subTint ? `var(--color-${subTint})` : 'var(--color-text-tertiary)', fontWeight: subTint ? 700 : 500 } }, sub),
   )
@@ -818,9 +819,11 @@ function ProductsTab({ app, api, onNavigate }) {
     const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000
     return products.filter(p => p.createdAt && new Date(p.createdAt).getTime() >= weekAgo).length
   }, [products])
+  // Coûts masqués (pas de droit costs:read) : valeur du stock NON calculée, pas de colonne d'achat.
+  const costsHidden = useMemo(() => resolveCostsHidden(app, products, levels), [app, products, levels])
   const stockValue = useMemo(() => {
-    return computeStockValue(levels, products)
-  }, [levels, products])
+    return computeStockValue(levels, products, { costsHidden })
+  }, [levels, products, costsHidden])
   const activeWarehouseCount = useMemo(() => warehouses.filter(w => w.isActive).length, [warehouses])
 
   const toggleSelect = useCallback((id) => {
@@ -916,13 +919,13 @@ function ProductsTab({ app, api, onNavigate }) {
 
   const handleExport = useCallback(() => {
     exportCSV(`produits_${new Date().toISOString().slice(0, 10)}.csv`,
-      ['Code', 'Nom', 'Catégorie', 'Unité', 'Stock', 'Seuil min', 'Prix de vente', 'Prix d\'achat', 'Statut'],
+      ['Code', 'Nom', 'Catégorie', 'Unité', 'Stock', 'Seuil min', 'Prix de vente', ...(costsHidden ? [] : ['Prix d\'achat']), 'Statut'],
       sorted.map(p => [
         p.code, p.name, p.categoryId ?? '', p.unit, stockByProduct.get(p.id) ?? 0, p.minThreshold ?? '',
-        p.salePrice ?? '', p.purchasePrice ?? '', p.isActive ? 'Actif' : 'Inactif',
+        p.salePrice ?? '', ...(costsHidden ? [] : [p.purchasePrice ?? '']), p.isActive ? 'Actif' : 'Inactif',
       ]),
     )
-  }, [sorted, stockByProduct])
+  }, [sorted, stockByProduct, costsHidden])
 
   const handleDeactivate = useCallback(async () => {
     if (!deletingId) return
@@ -998,8 +1001,9 @@ function ProductsTab({ app, api, onNavigate }) {
         subTint: newThisWeekCount > 0 ? 'success' : undefined,
       }),
       React.createElement(KpiCard, {
-        icon: Icon.trending, tint: 'success', label: 'Valeur du stock', value: stockValue.value.toLocaleString('fr-FR', { maximumFractionDigits: 0 }),
-        sub: stockValue.unpriced > 0 ? `${stockValue.unpriced} ligne(s) de stock sans coût, non valorisée(s)` : `Sur ${activeWarehouseCount} entrepôt${activeWarehouseCount > 1 ? 's' : ''} actif${activeWarehouseCount > 1 ? 's' : ''}`,
+        icon: Icon.trending, tint: 'success', label: 'Valeur du stock', value: formatMaybeCost(stockValue.value, { maximumFractionDigits: 0 }),
+        valueTitle: stockValue.value == null ? COST_MASKED_HINT : undefined,
+        sub: stockValue.value == null ? 'Valeur masquée' : stockValue.unpriced > 0 ? `${stockValue.unpriced} ligne(s) de stock sans coût, non valorisée(s)` : `Sur ${activeWarehouseCount} entrepôt${activeWarehouseCount > 1 ? 's' : ''} actif${activeWarehouseCount > 1 ? 's' : ''}`,
       }),
       React.createElement(KpiCard, {
         icon: Icon.warehouse, tint: 'info', label: 'Entrepôts actifs', value: activeWarehouseCount.toLocaleString('fr-FR'),
@@ -1148,7 +1152,7 @@ function ProductsTab({ app, api, onNavigate }) {
                   React.createElement('td', { style: S.td }, React.createElement(StockBar, { quantity: stockByProduct.get(p.id) ?? 0, minThreshold: p.minThreshold ?? 0 })),
                   React.createElement('td', { style: S.td },
                     React.createElement('div', { style: { fontFamily: 'monospace', fontWeight: 600 } }, p.salePrice != null ? p.salePrice.toLocaleString('fr-FR') : '—'),
-                    p.purchasePrice != null && React.createElement('div', { style: { fontSize: 11, color: 'var(--color-text-tertiary)' } }, `Achat ${p.purchasePrice.toLocaleString('fr-FR')}`),
+                    !costsHidden && hasCost(p.purchasePrice) && React.createElement('div', { style: { fontSize: 11, color: 'var(--color-text-tertiary)' } }, `Achat ${formatMaybeCost(p.purchasePrice)}`),
                   ),
                   React.createElement('td', { style: S.td }, React.createElement(DotBadge, { status: p.isActive, label: p.isActive ? 'Actif' : 'Inactif' })),
                   React.createElement('td', { style: { ...S.td, textAlign: 'right' }, onClick: e => e.stopPropagation() },
@@ -1202,7 +1206,7 @@ function ProductsTab({ app, api, onNavigate }) {
       ),
     ),
     formOpen && React.createElement(ProductFormModal, {
-      app, product: edit, onSave: handleSave, saving,
+      app, product: edit, onSave: handleSave, saving, costsHidden,
       onClose: () => { setFormOpen(false); setEdit(null) },
       categories: knownCategories, existingCodes: products.map(p => p.code), warehouses,
     }),
@@ -1292,7 +1296,9 @@ function generateProductCode(existingCodes) {
   return `PROD${Date.now()}`
 }
 
-function ProductFormModal({ app, product, onSave, onClose, saving, categories, existingCodes, warehouses }) {
+function ProductFormModal({ app, product, onSave, onClose, saving, categories, existingCodes, warehouses, costsHidden = false }) {
+  // Sans le droit coûts, le prix d'achat est masqué : champ caché et jamais renvoyé (le serveur l'ignorerait).
+  const hideCost = costsHidden || costsDenied(app)
   const isEdit = !!product
   const [form, setForm] = useState({
     code: product?.code ?? '',
@@ -1301,7 +1307,7 @@ function ProductFormModal({ app, product, onSave, onClose, saving, categories, e
     unit: product?.unit ?? UNITS[0],
     valuationMethod: product?.valuationMethod ?? 'fefo',
     salePrice: product?.salePrice ?? 0,
-    purchasePrice: product?.purchasePrice ?? 0,
+    purchasePrice: hasCost(product?.purchasePrice) ? product.purchasePrice : 0,
     minThreshold: product?.minThreshold ?? DEFAULT_MIN_THRESHOLD,
     maxThreshold: product?.maxThreshold ?? DEFAULT_MAX_THRESHOLD,
     isActive: product?.isActive ?? true,
@@ -1350,7 +1356,7 @@ function ProductFormModal({ app, product, onSave, onClose, saving, categories, e
       next.maxThreshold = 'Le seuil max doit être supérieur au seuil min'
     }
     if (form.salePrice < 0) next.salePrice = 'Le prix ne peut pas être négatif'
-    if (form.purchasePrice < 0) next.purchasePrice = 'Le prix ne peut pas être négatif'
+    if (!hideCost && form.purchasePrice < 0) next.purchasePrice = 'Le prix ne peut pas être négatif'
     if (Object.keys(next).length) { setErrors(next); return }
 
     // Code laissé vide → généré (P3.2). En édition il n'est pas modifiable,
@@ -1361,6 +1367,7 @@ function ProductFormModal({ app, product, onSave, onClose, saving, categories, e
     }
 
     const payload = { ...form }
+    if (hideCost) delete payload.purchasePrice
     if (isEdit) payload.code = undefined          // absent de ProductUpdate
     else if (!payload.code.trim()) payload.code = generateProductCode(existingCodes)
 
@@ -1416,7 +1423,7 @@ function ProductFormModal({ app, product, onSave, onClose, saving, categories, e
           fieldLabel('Prix de vente'),
           React.createElement('input', { style: inputStyle('salePrice'), type: 'number', min: 0, step: 0.01, value: form.salePrice, onChange: setNum('salePrice') }),
         ),
-        React.createElement('div', null,
+        !hideCost && React.createElement('div', null,
           fieldLabel("Prix d'achat"),
           React.createElement('input', { style: inputStyle('purchasePrice'), type: 'number', min: 0, step: 0.01, value: form.purchasePrice, onChange: setNum('purchasePrice') }),
         ),
@@ -1521,7 +1528,7 @@ function WarehouseFormModal({ app, warehouse, onSave, onClose, saving }) {
 // d'alerte, stats rappelées, tendance 7 jours, répartition des produits
 // stockés, mouvements récents. Tout est dérivé des données déjà chargées par
 // WarehousesTab (products/levels/moves), rien n'est recalculé côté serveur.
-function WarehouseDetailModal({ warehouse, stats, trend, products, levels, moves, onClose, onEdit, onViewProducts }) {
+function WarehouseDetailModal({ warehouse, stats, trend, products, levels, moves, onClose, onEdit, onViewProducts, costsHidden = false }) {
   const productById = useMemo(() => new Map(products.map(p => [p.id, p])), [products])
 
   const breakdown = useMemo(() => {
@@ -1533,11 +1540,12 @@ function WarehouseDetailModal({ warehouse, stats, trend, products, levels, moves
         productId: l.productId,
         name: product?.name ?? l.productId,
         quantity: l.availableQuantity,
-        value: l.availableQuantity * (product?.purchasePrice ?? 0),
+        // Coût masqué : on classe par quantité (jamais par une valeur à 0 inventée).
+        value: costsHidden ? l.availableQuantity : l.availableQuantity * (product?.purchasePrice ?? 0),
       })
     }
     return rows.sort((a, b) => b.value - a.value).slice(0, 5)
-  }, [levels, productById, warehouse.id])
+  }, [levels, productById, warehouse.id, costsHidden])
 
   const maxBreakdownValue = Math.max(1, ...breakdown.map(r => r.value))
 
@@ -1568,10 +1576,10 @@ function WarehouseDetailModal({ warehouse, stats, trend, products, levels, moves
         [
           ['Références', stats.skus.size, 'var(--color-text-primary)'],
           ['Unités', stats.units.toLocaleString('fr-FR'), 'var(--color-text-primary)'],
-          ['Valeur', stats.value.toLocaleString('fr-FR'), 'var(--color-text-primary)'],
+          ['Valeur', formatMaybeCost(stats.value), 'var(--color-text-primary)', stats.value == null ? COST_MASKED_HINT : undefined],
           ['Alertes', stats.alerts.size, stats.alerts.size > 0 ? 'var(--color-danger)' : 'var(--color-text-primary)'],
-        ].map(([label, value, color]) =>
-          React.createElement('div', { key: label, style: { padding: 12, borderRadius: 10, background: 'var(--color-surface-subtle)' } },
+        ].map(([label, value, color, title]) =>
+          React.createElement('div', { key: label, title, style: { padding: 12, borderRadius: 10, background: 'var(--color-surface-subtle)' } },
             React.createElement('div', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', color: 'var(--color-text-tertiary)', marginBottom: 4 } }, label),
             React.createElement('div', { style: { fontSize: 17, fontWeight: 800, fontFamily: 'monospace', color } }, value),
           ),
@@ -1653,7 +1661,8 @@ function WarehousesTab({ app, api, onNavigate }) {
   useEffect(() => { load() }, [load])
   useEffect(() => app.onRealtime('xstock', () => load(true)), [load])
 
-  const statsByWarehouse = useMemo(() => warehouseStats(levels, products), [products, levels])
+  const costsHidden = useMemo(() => resolveCostsHidden(app, products, levels), [app, products, levels])
+  const statsByWarehouse = useMemo(() => warehouseStats(levels, products, { costsHidden }), [products, levels, costsHidden])
 
   // Tendance 7 jours par entrepôt — dérivée des vrais mouvements (delta de
   // solde jour par jour), affichée en mini-sparkline sur chaque carte.
@@ -1667,9 +1676,8 @@ function WarehousesTab({ app, api, onNavigate }) {
   // cartes individuelles, juste sommés sur tout le parc d'entrepôts.
   const activeWarehouseCount = useMemo(() => warehouses.filter(w => w.isActive).length, [warehouses])
   const totalStockValue = useMemo(() => {
-    let sum = 0
-    for (const stats of statsByWarehouse.values()) sum += stats.value
-    return sum
+    // null dès qu'une valeur d'entrepôt est masquée : jamais de somme partielle.
+    return sumOrNull([...statsByWarehouse.values()].map(st => st.value))
   }, [statsByWarehouse])
   const trackedSkuCount = useMemo(() => {
     const all = new Set()
@@ -1711,7 +1719,7 @@ function WarehousesTab({ app, api, onNavigate }) {
   if (loading) return Spinner()
   if (loadError) return React.createElement(ScreenState, { failure: loadError, onRetry: () => load() })
 
-  const emptyStats = { skus: new Set(), units: 0, value: 0, alerts: new Set() }
+  const emptyStats = { skus: new Set(), units: 0, value: costsHidden ? null : 0, alerts: new Set() }
 
   return React.createElement(Fragment, null,
     React.createElement(LimitNotice, { notes: limited }),
@@ -1721,7 +1729,8 @@ function WarehousesTab({ app, api, onNavigate }) {
         sub: warehouses.length > activeWarehouseCount ? `${warehouses.length - activeWarehouseCount} inactif(s)` : `${warehouses.length} au total`,
       }),
       React.createElement(KpiCard, {
-        icon: Icon.trending, tint: 'success', label: 'Valeur du stock', value: totalStockValue.toLocaleString('fr-FR', { maximumFractionDigits: 0 }),
+        icon: Icon.trending, tint: 'success', label: 'Valeur du stock', value: formatMaybeCost(totalStockValue, { maximumFractionDigits: 0 }),
+        valueTitle: totalStockValue == null ? COST_MASKED_HINT : undefined,
         sub: 'Tous entrepôts confondus',
       }),
       React.createElement(KpiCard, {
@@ -1791,7 +1800,7 @@ function WarehousesTab({ app, api, onNavigate }) {
                     React.createElement('div', { style: { fontSize: 15, fontWeight: 700, fontFamily: 'monospace' } }, stats.units.toLocaleString('fr-FR'))),
                   React.createElement('div', null,
                     React.createElement('div', { style: { fontSize: 10, color: 'var(--color-text-tertiary)', textTransform: 'uppercase', fontWeight: 600 } }, 'Valeur'),
-                    React.createElement('div', { style: { fontSize: 15, fontWeight: 700, fontFamily: 'monospace' } }, stats.value.toLocaleString('fr-FR'))),
+                    React.createElement('div', { title: stats.value == null ? COST_MASKED_HINT : undefined, style: { fontSize: 15, fontWeight: 700, fontFamily: 'monospace' } }, formatMaybeCost(stats.value))),
                   hasAlert && React.createElement('div', null,
                     React.createElement('div', { style: { fontSize: 10, color: 'var(--color-danger)', textTransform: 'uppercase', fontWeight: 600 } }, 'Alertes'),
                     React.createElement('div', { style: { fontSize: 15, fontWeight: 700, fontFamily: 'monospace', color: 'var(--color-danger)' } }, stats.alerts.size)),
@@ -1820,7 +1829,7 @@ function WarehousesTab({ app, api, onNavigate }) {
       warehouse: detailWarehouse,
       stats: statsByWarehouse.get(detailWarehouse.id) ?? emptyStats,
       trend: trendByWarehouse.get(detailWarehouse.id) ?? [],
-      products, levels, moves,
+      products, levels, moves, costsHidden,
       onClose: () => setDetailWarehouse(null),
       onEdit: () => { setEditingWarehouse(detailWarehouse); setDetailWarehouse(null); setFormOpen(true) },
       onViewProducts: () => { setDetailWarehouse(null); onNavigate?.('products') },

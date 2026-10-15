@@ -175,3 +175,12 @@ test('pas de tendance sans mouvement dans les 14 jours même si la période pré
 test('le titre ne mentionne ni valeur ni coût', () => {
   assert.ok(!/valeur|coût|FCFA/i.test(movementsTrend([M(1, 'a')], NOW).title))
 })
+
+// ── Aucun coût divulgué, même quand les champs de coût existent ──────────────
+test('widgets : aucune valeur de coût dans les sorties (coûts renseignés ou null)', () => {
+  const costs = { purchasePrice: 123456, averageCost: 987654 }
+  const products = [P('a', 'A', 5, costs), P('b', 'B', 5, { purchasePrice: null })]
+  const levels = [L('a', 1, { averageCost: 987654 }), L('b', 0, { averageCost: null })]
+  const out = JSON.stringify([lowStockSummary(products, levels), lowStockTodoRows(products, levels)])
+  assert.doesNotMatch(out, /123|456|987|654|NaN|undefined|null/)
+})
