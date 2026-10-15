@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { readImportFile } from './import-file.js'
 import {
   normalizeHeader, autoMap, setColumnField, missingRequired, ignoredColumns, buildRows, chunk, blockBody, newImportId,
-  detectDuplicates, mergeReports, addReport, emptyReport, withLocalErrors, summaryDryRun, summaryFinal, validCount,
+  detectDuplicates, parseSector, mergeReports, addReport, emptyReport, withLocalErrors, summaryDryRun, summaryFinal, validCount,
   describeImportError, errorsCsv, templateCsv, normalizeDate, normalizeQuantity, canImport, availableKinds, warningText,
   KIND_PRODUCTS as P, KIND_OPENING as O,
 } from './import-mapping.js'
@@ -194,4 +194,14 @@ test('CSV des erreurs : BOM, point-virgule, guillemets doublés, tri par ligne',
 test('warningText : cost_ignored en clair', () => {
   assert.match(warningText({ code: 'cost_ignored', count: 3 }), /Prix d'achat ignoré.*3 lignes/)
   assert.equal(warningText({ code: 'z', message: 'Hop' }), 'Hop')
+})
+test('parseSector : pharmacie, autre, absent, erreur', () => {
+  assert.deepEqual(parseSector({ tenant_id: 't', currency: 'XOF', sector: 'pharmacie' }), { sector: 'pharmacie', pharmacy: true, state: 'ok' })
+  assert.equal(parseSector({ sector: ' Pharmacie ' }).pharmacy, true)
+  assert.deepEqual(parseSector({ sector: 'quincaillerie' }), { sector: 'quincaillerie', pharmacy: false, state: 'ok' })
+  assert.equal(parseSector({ sector: null }).state, 'absent')
+  assert.equal(parseSector({}).state, 'absent')
+  assert.equal(parseSector({ sector: '' }).pharmacy, false)
+  for (const bad of [null, undefined, 'x', [], 12]) assert.equal(parseSector(bad).state, 'error')
+  assert.deepEqual(parseSector({ sector: 'pharmacie' }, true), { sector: null, pharmacy: false, state: 'error' })
 })

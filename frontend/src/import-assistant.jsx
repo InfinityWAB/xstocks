@@ -5,7 +5,7 @@ import { readImportFile, classifyFileName, delimiterLabel, MAX_IMPORT_ROWS, MAX_
 import {
   KIND_PRODUCTS, KIND_OPENING, fieldsFor, autoMap, setColumnField, missingRequired, ignoredColumns, buildRows, chunk,
   blockBody, newImportId, detectDuplicates, mergeReports, withLocalErrors, sortedErrors, summaryDryRun, summaryFinal,
-  validCount, describeImportError, errorsCsv, templateCsv, templateFilename, fieldLabel, warningText, availableKinds,
+  validCount, parseSector, describeImportError, errorsCsv, templateCsv, templateFilename, fieldLabel, warningText, availableKinds,
 } from './lib/import-mapping.js'
 import { costsDenied } from './lib/costs.js'
 
@@ -31,6 +31,7 @@ export function ImportAssistant({ app, ui, post, readSector, onClose, onDone }) 
   const kinds = useMemo(() => availableKinds(app), [app])
   const [kind, setKind] = useState(kinds[0] ?? KIND_PRODUCTS)
   const [pharmacy, setPharmacy] = useState(false)
+  const [sectorState, setSectorState] = useState('loading')
   const [file, setFile] = useState(null)      // { name, parsed }
   const [fileError, setFileError] = useState('')
   const [help, setHelp] = useState('')
@@ -50,7 +51,10 @@ export function ImportAssistant({ app, ui, post, readSector, onClose, onDone }) 
 
   useEffect(() => {
     let live = true
-    Promise.resolve().then(() => readSector?.()).then(s => { if (live) setPharmacy(String(s ?? '').toLowerCase() === 'pharmacie') }).catch(() => {})
+    Promise.resolve().then(() => readSector?.()).then(
+      r => parseSector(r),
+      () => parseSector(null, true),
+    ).then(s => { if (live) { setPharmacy(s.pharmacy); setSectorState(s.state) } })
     return () => { live = false }
   }, [])
   useEffect(() => () => { token.current++ }, [])
@@ -184,7 +188,8 @@ export function ImportAssistant({ app, ui, post, readSector, onClose, onDone }) 
         h('button', { type: 'button', style: S.btnSecondary, onClick: () => download(templateFilename(kind), templateCsv(kind, opts)) },
           h(Icon.download, { size: 14 }), ' Télécharger le modèle'),
         h('span', { style: muted }, 'Colonnes recommandées et 2 exemples, à ouvrir dans Excel.')),
-      !pharmacy && h('div', { key: 'p', style: muted }, 'Les colonnes propres à la pharmacie (DCI, forme, dosage, stupéfiant) ne sont proposées que si le secteur de l’entreprise est « Pharmacie ».'),
+      sectorState === 'error' && h('div', { key: 'se', style: muted }, 'Secteur non lu : les colonnes propres à la pharmacie sont masquées. Réessayez plus tard si votre entreprise est une pharmacie.'),
+      !pharmacy && sectorState !== 'error' && h('div', { key: 'p', style: muted }, 'Les colonnes propres à la pharmacie (DCI, forme, dosage, stupéfiant) ne sont proposées que si le secteur de l’entreprise est « Pharmacie ».'),
     ]
   } else if (step === 'check') {
     const p = file.parsed

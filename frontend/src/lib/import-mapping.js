@@ -27,6 +27,20 @@ export function availableKinds(app) {
   return [KIND_PRODUCTS, KIND_OPENING].filter(k => canImport(app, k))
 }
 
+/* ─── Secteur de l'entreprise ──────────────────────────────────────────── */
+
+/**
+ * Lit la réponse de GET /tenants/{id}/business-settings ({ tenant_id, currency, sector, … }).
+ * { sector, pharmacy, state } : state = 'ok' (secteur connu), 'absent' (réponse valide sans secteur),
+ * 'error' (réponse illisible ou lecture échouée : on ne présume rien, colonnes pharmacie masquées).
+ */
+export function parseSector(response, failed = false) {
+  if (failed || response == null || typeof response !== 'object' || Array.isArray(response)) return { sector: null, pharmacy: false, state: 'error' }
+  const raw = typeof response.sector === 'string' ? response.sector.trim().toLowerCase() : ''
+  if (!raw) return { sector: null, pharmacy: false, state: 'absent' }
+  return { sector: raw, pharmacy: raw === 'pharmacie', state: 'ok' }
+}
+
 /* ─── Champs reconnus ──────────────────────────────────────────────────── */
 
 // `syn` : synonymes (déjà sous forme normalisée : sans accents, minuscules, sans ponctuation).

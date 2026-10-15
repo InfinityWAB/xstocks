@@ -108,8 +108,13 @@ function api(app) {
     imports: {
       // Un bloc (500 lignes max) ; le rapport du serveur est rendu tel quel.
       post:   (kind, body) => app.apiPost(`${BASE}${ENDPOINTS[kind]}`, body),
-      // Secteur de l'entreprise (colonnes pharmacie) ; null si l'endpoint est indisponible.
-      sector: () => app.apiGet('/app/company/parametres/secteur').then(r => r?.sector ?? null).catch(() => null),
+      // Réglages d'entreprise (secteur) : route du plugin auth, tenant courant via app.getTenant()
+      // (comme la liste des membres plus haut). Renvoie la réponse brute ; l'erreur remonte.
+      sector: () => {
+        const tenantId = app.getTenant?.()?.id
+        if (!tenantId) return Promise.reject(new Error('tenant inconnu'))
+        return app.apiGet(`/app/auth/tenants/${tenantId}/business-settings`)
+      },
     },
     attachments: {
       listForOwner: (ownerType, ownerId) => app.apiGet(`${BASE}/attachments/by-owner/${ownerType}/${ownerId}`),
