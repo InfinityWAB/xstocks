@@ -9,6 +9,8 @@ import {
   parseTiersInput, formatTiers, tiersFromSettings, canUseExpired, settingsLocked,
   validateExpiredIssue, buildExpiredIssue, issuePlan, expiredIssueProblem, EXPIRED_REASON_MAX, MAX_TIER_DAYS,
 } from './lib/batches.js'
+import { ImportAssistant } from './import-assistant.jsx'
+import { ENDPOINTS, availableKinds } from './lib/import-mapping.js'
 import { lowStockSummary, lowStockTodoRows, movementsTrend } from './lib/dashboardWidgets.js'
 
 const BASE = '/app/xstock'
@@ -102,6 +104,17 @@ function api(app) {
       approveSuggestion:  (id) => app.apiPost(`${BASE}/intelligence/transfer-suggestions/${id}/approve`, {}),
       rejectSuggestion:   (id) => app.apiPost(`${BASE}/intelligence/transfer-suggestions/${id}/reject`, {}),
       executeSuggestion:  (id) => app.apiPost(`${BASE}/intelligence/transfer-suggestions/${id}/execute`, {}),
+    },
+    imports: {
+      // Un bloc (500 lignes max) ; le rapport du serveur est rendu tel quel.
+      post:   (kind, body) => app.apiPost(`${BASE}${ENDPOINTS[kind]}`, body),
+      // Réglages d'entreprise (secteur) : route du plugin auth, tenant courant via app.getTenant()
+      // (comme la liste des membres plus haut). Renvoie la réponse brute ; l'erreur remonte.
+      sector: () => {
+        const tenantId = app.getTenant?.()?.id
+        if (!tenantId) return Promise.reject(new Error('tenant inconnu'))
+        return app.apiGet(`/app/auth/tenants/${tenantId}/business-settings`)
+      },
     },
     attachments: {
       listForOwner: (ownerType, ownerId) => app.apiGet(`${BASE}/attachments/by-owner/${ownerType}/${ownerId}`),
@@ -814,6 +827,8 @@ function ProductsTab({ app, api, onNavigate }) {
   const [sortKey, setSortKey] = useState('name')
   const [sortDir, setSortDir] = useState('asc')
   const [selected, setSelected] = useState(() => new Set())
+  const [importOpen, setImportOpen] = useState(false)
+  const canImportAny = availableKinds(app).length > 0
 
   const toggleSort = useCallback((key) => {
     setSortKey(prevKey => {
@@ -1118,6 +1133,8 @@ function ProductsTab({ app, api, onNavigate }) {
       React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 } },
         React.createElement('button', { style: S.btnSecondary, onClick: handleExport, title: 'Exporter en CSV' },
           React.createElement(Icon.download, { size: 14 }), ' Exporter'),
+        canImportAny && React.createElement('button', { style: S.btnSecondary, onClick: () => setImportOpen(true), title: 'Importer des produits ou un stock de départ depuis un fichier CSV' },
+          React.createElement(Icon.upload, { size: 14 }), ' Importer'),
         React.createElement('button', { style: S.btnPrimary, onClick: () => { setEdit(null); setFormOpen(true) } },
           React.createElement(Icon.plus, { size: 15 }), ' Nouveau produit'),
       ),
@@ -1269,6 +1286,10 @@ function ProductsTab({ app, api, onNavigate }) {
       app, product: edit, onSave: handleSave, saving, costsHidden,
       onClose: () => { setFormOpen(false); setEdit(null) },
       categories: knownCategories, existingCodes: products.map(p => p.code), warehouses,
+    }),
+    importOpen && React.createElement(ImportAssistant, {
+      app, ui: { ModalShell, ModalHeader, S, Icon }, post: api.imports.post, readSector: api.imports.sector,
+      onClose: () => setImportOpen(false), onDone: () => load(true),
     }),
     lotsOf && React.createElement(LotsModal, {
       app, api, product: lotsOf, onClose: () => setLotsOf(null), onChanged: () => load(true),
