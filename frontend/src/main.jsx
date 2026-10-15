@@ -4,6 +4,11 @@ import { formatMaybeCost, sumOrNull, hasCost, costsDenied, COST_MASKED_HINT } fr
 import { fetchAllPages, truncationNotice } from './lib/pagination.js'
 import { screenKind, classifyError, SCREEN_MESSAGES } from './lib/screenState.js'
 import { STOCK_ACCESS_PERMISSION } from './lib/permissions.js'
+import {
+  batchState, sellableColumn, sellableByProduct, sellableOf, formatStockError, insufficientInfo, formatDay,
+  parseTiersInput, formatTiers, tiersFromSettings, canUseExpired, settingsLocked,
+  validateExpiredIssue, buildExpiredIssue, issuePlan, expiredIssueProblem, EXPIRED_REASON_MAX, MAX_TIER_DAYS,
+} from './lib/batches.js'
 import { lowStockSummary, lowStockTodoRows, movementsTrend } from './lib/dashboardWidgets.js'
 
 const BASE = '/app/xstock'
@@ -360,6 +365,17 @@ function ModalShell({ children, wide, onClose }) {
 
   const overlayStyle = { ...overlayBase, ...(desktop ? overlayDesktop : {}) }
   const panelStyle = { ...panelBase, ...(desktop ? panelDesktop : {}), ...(wide ? panelWide : {}) }
+  const panelRef = React.useRef(null)
+
+  // Accessibilité : Échap ferme, le focus entre dans la fenêtre et revient à l'élément d'origine.
+  React.useEffect(() => {
+    const previous = document.activeElement
+    const first = panelRef.current?.querySelector('input:not([type=hidden]), select, textarea')
+    first?.focus?.()
+    const onKey = (e) => { if (e.key === 'Escape') onClose?.() }
+    document.addEventListener('keydown', onKey)
+    return () => { document.removeEventListener('keydown', onKey); previous?.focus?.() }
+  }, [])
 
   const content = React.createElement(React.Fragment, null,
     React.createElement(ModalStyle),
@@ -367,7 +383,7 @@ function ModalShell({ children, wide, onClose }) {
       className: 'xstock-plugin', style: overlayStyle,
       onClick: e => { if (e.target === e.currentTarget) onClose?.() },
     },
-      React.createElement('div', { style: panelStyle }, children),
+      React.createElement('div', { ref: panelRef, role: 'dialog', 'aria-modal': 'true', style: panelStyle }, children),
     ),
   )
 
@@ -400,6 +416,12 @@ function ModalHeader({ title, subtitle, onClose }) {
 /* ─── Confirm dialog ─────────────────────────────────────────────────── */
 
 function ConfirmDialog({ title, message, confirmLabel, danger, onConfirm, onCancel }) {
+  // Échap annule cette confirmation seule (capture : la fenêtre dessous ne se ferme pas).
+  React.useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); onCancel?.() } }
+    document.addEventListener('keydown', onKey, true)
+    return () => document.removeEventListener('keydown', onKey, true)
+  }, [])
   const content = React.createElement(React.Fragment, null,
     React.createElement(ModalStyle),
     React.createElement('div', {
@@ -415,6 +437,7 @@ function ConfirmDialog({ title, message, confirmLabel, danger, onConfirm, onCanc
       onClick: e => { if (e.target === e.currentTarget) onCancel?.() },
     },
       React.createElement('div', {
+        role: 'alertdialog', 'aria-modal': 'true', 'aria-label': title,
         style: {
           width: '100%', maxWidth: 380,
           background: 'var(--color-popover, #fff)',
@@ -492,6 +515,21 @@ const DotBadge = ({ status, label }) => {
     label ?? String(status ?? '—'),
   )
 }
+
+// Badge d'état de lot : le TEXTE porte l'information (Périmé, Quarantaine, Expire dans N j), la couleur
+// n'est qu'un renfort. Rien pour un lot valide ou un serveur sans ces champs.
+const LOT_TONES = {
+  danger: ['var(--color-danger-muted)', 'var(--color-danger-text)', 'var(--color-danger-border)'],
+  warning: ['var(--color-warning-muted)', 'var(--color-warning-text)', 'var(--color-warning-border)'],
+  neutral: ['var(--color-surface-subtle)', 'var(--color-text-secondary)', 'var(--color-border)'],
+}
+const LotBadge = ({ state }) => {
+  if (!state?.label) return null
+  const [bg, fg, br] = LOT_TONES[state.tone] ?? LOT_TONES.neutral
+  return React.createElement('span', { style: S.badge(bg, fg, br), title: state.detail || undefined }, state.label)
+}
+
+const fmtQty = (n) => Number(n ?? 0).toLocaleString('fr-FR', { maximumFractionDigits: 3 })
 
 /* ─── KPI card ─────────────────────────────────────────────────────────── */
 
@@ -772,6 +810,7 @@ function ProductsTab({ app, api, onNavigate }) {
   const [saving, setSaving] = useState(false)
   const [deletingId, setDeletingId] = useState(null)
   const [adjusting, setAdjusting] = useState(null)
+  const [lotsOf, setLotsOf] = useState(null)
   const [sortKey, setSortKey] = useState('name')
   const [sortDir, setSortDir] = useState('asc')
   const [selected, setSelected] = useState(() => new Set())
@@ -799,6 +838,16 @@ function ProductsTab({ app, api, onNavigate }) {
 
   const stockByProduct = useMemo(() => {
     return quantityByProduct(levels)
+  }, [levels])
+
+  // Vendable : colonne affichée seulement si le serveur le fournit et qu'un produit est suivi par lot
+  // ou a une partie de son stock non vendable (périmé, quarantaine).
+  const sellableCol = useMemo(() => sellableColumn(products, levels), [products, levels])
+  const sellableMap = useMemo(() => sellableByProduct(levels), [levels])
+  const lotLevelsByProduct = useMemo(() => {
+    const m = new Map()
+    for (const l of levels) if (l.batchId) m.set(l.productId, (m.get(l.productId) ?? 0) + 1)
+    return m
   }, [levels])
 
   const categories = useMemo(() =>
@@ -906,6 +955,7 @@ function ProductsTab({ app, api, onNavigate }) {
       name: p => p.name?.toLowerCase() ?? '',
       categoryId: p => p.categoryId?.toLowerCase() ?? '',
       stock: p => stockByProduct.get(p.id) ?? 0,
+      sellable: p => sellableMap.get(p.id)?.sellable ?? 0,
       salePrice: p => p.salePrice ?? 0,
       isActive: p => p.isActive ? 1 : 0,
     }[sortKey]
@@ -915,7 +965,7 @@ function ProductsTab({ app, api, onNavigate }) {
       if (av > bv) return 1 * dir
       return 0
     })
-  }, [filtered, sortKey, sortDir, stockByProduct])
+  }, [filtered, sortKey, sortDir, stockByProduct, sellableMap])
 
   const handleExport = useCallback(() => {
     exportCSV(`produits_${new Date().toISOString().slice(0, 10)}.csv`,
@@ -961,7 +1011,7 @@ function ProductsTab({ app, api, onNavigate }) {
               reason: 'Stock initial',
             })
           } catch (e) {
-            app.notify(`Produit créé, mais le stock initial n'a pas pu être enregistré : ${e?.message ?? 'erreur'}`, 'warning')
+            app.notify(`Produit créé, mais le stock initial n'a pas pu être enregistré : ${formatStockError(e, { fallback: 'erreur' })}`, 'warning')
           }
         }
       }
@@ -1086,7 +1136,7 @@ function ProductsTab({ app, api, onNavigate }) {
                 }),
               }),
             ),
-            [['Produit', 'name'], ['Catégorie', 'categoryId'], ['Code', 'code'], ['Créé le', 'createdAt'], ['Stock', 'stock'], ['Prix de vente', 'salePrice'], ['Statut', 'isActive'], ['Action', null]].map(([h, key]) =>
+            [['Produit', 'name'], ['Catégorie', 'categoryId'], ['Code', 'code'], ['Créé le', 'createdAt'], ['Stock', 'stock'], ...(sellableCol.visible ? [['Vendable', 'sellable']] : []), ['Prix de vente', 'salePrice'], ['Statut', 'isActive'], ['Action', null]].map(([h, key]) =>
               React.createElement('th', {
                 key: h ?? 'actions', className: key ? 'xstock-sortable-th' : undefined,
                 style: { ...S.th, cursor: key ? 'pointer' : 'default', userSelect: 'none' },
@@ -1105,7 +1155,7 @@ function ProductsTab({ app, api, onNavigate }) {
         React.createElement('tbody', null,
           sorted.length === 0
             ? React.createElement('tr', null,
-                React.createElement('td', { colSpan: 8, style: { border: 'none' } },
+                React.createElement('td', { colSpan: sellableCol.visible ? 9 : 8, style: { border: 'none' } },
                   products.length === 0
                     ? React.createElement(EmptyState, {
                         icon: Icon.package, title: 'Aucun produit pour le moment',
@@ -1150,6 +1200,14 @@ function ProductsTab({ app, api, onNavigate }) {
                   React.createElement('td', { style: { ...S.td, fontSize: 12, color: 'var(--color-text-tertiary)' } },
                     p.createdAt ? new Date(p.createdAt).toLocaleDateString('fr-FR') : '—'),
                   React.createElement('td', { style: S.td }, React.createElement(StockBar, { quantity: stockByProduct.get(p.id) ?? 0, minThreshold: p.minThreshold ?? 0 })),
+                  sellableCol.visible && React.createElement('td', { style: S.td }, (() => {
+                    if (!sellableCol.shows(p.id)) return React.createElement('span', { style: { color: 'var(--color-text-tertiary)' }, title: 'Tout le stock est vendable' }, '—')
+                    const v = sellableMap.get(p.id) ?? { total: 0, sellable: 0, gap: false }
+                    return React.createElement('div', null,
+                      React.createElement('div', { style: { fontFamily: 'monospace', fontWeight: 600 } }, fmtQty(v.sellable)),
+                      v.gap && React.createElement('div', { style: { fontSize: 11, color: 'var(--color-warning-text)' } },
+                        `${fmtQty(v.total - v.sellable)} non vendable${v.total - v.sellable > 1 ? 's' : ''}`))
+                  })()),
                   React.createElement('td', { style: S.td },
                     React.createElement('div', { style: { fontFamily: 'monospace', fontWeight: 600 } }, p.salePrice != null ? p.salePrice.toLocaleString('fr-FR') : '—'),
                     !costsHidden && hasCost(p.purchasePrice) && React.createElement('div', { style: { fontSize: 11, color: 'var(--color-text-tertiary)' } }, `Achat ${formatMaybeCost(p.purchasePrice)}`),
@@ -1160,6 +1218,8 @@ function ProductsTab({ app, api, onNavigate }) {
                       items: [
                         { label: 'Modifier', icon: Icon.edit, onClick: () => { setEdit(p); setFormOpen(true) } },
                         { label: 'Ajuster le stock', icon: Icon.arrows, onClick: () => setAdjusting(p) },
+                        ...(p.isLotTracked || lotLevelsByProduct.has(p.id)
+                          ? [{ label: 'Lots et péremption', icon: Icon.package, onClick: () => setLotsOf(p) }] : []),
                         { divider: true },
                         p.isActive
                           ? { label: 'Désactiver', icon: Icon.trash, danger: true, onClick: () => setDeletingId(p.id) }
@@ -1210,6 +1270,9 @@ function ProductsTab({ app, api, onNavigate }) {
       onClose: () => { setFormOpen(false); setEdit(null) },
       categories: knownCategories, existingCodes: products.map(p => p.code), warehouses,
     }),
+    lotsOf && React.createElement(LotsModal, {
+      app, api, product: lotsOf, onClose: () => setLotsOf(null), onChanged: () => load(true),
+    }),
     adjusting && React.createElement(AdjustStockModal, {
       product: adjusting, warehouses, onSave: handleAdjust, onClose: () => setAdjusting(null), saving,
     }),
@@ -1220,6 +1283,156 @@ function ProductsTab({ app, api, onNavigate }) {
       danger: true,
       onConfirm: handleDeactivate,
       onCancel: () => setDeletingId(null),
+    }),
+  )
+}
+
+/* ─── Lots et péremption ─────────────────────────────────────────────────
+   Détail des lots d'un produit : quantité, vendable, péremption, état (texte + couleur).
+   La sortie d'un lot périmé (dérogation) n'est proposée qu'avec le droit xstock:batches:use_expired
+   (app.can) et exige un motif + une confirmation. */
+
+const shortId = (id) => (id ? `…${String(id).slice(-6)}` : '—')
+
+function LotsModal({ app, api, product, onClose, onChanged }) {
+  const [levels, setLevels] = useState(null)
+  const [tiers, setTiers] = useState(null)
+  const [error, setError] = useState(null)
+  const [derog, setDerog] = useState(null)
+  const mayDerogate = canUseExpired(app)
+
+  const load = useCallback(async () => {
+    setError(null)
+    try {
+      const [l, s] = await Promise.all([
+        api.movements.levelsByProduct(product.id),
+        // Les paliers viennent des réglages ; sans le droit de lecture on retombe sur 90/30/7.
+        api.settings.get().catch(() => null),
+      ])
+      setLevels(Array.isArray(l) ? l : [])
+      setTiers(tiersFromSettings(s))
+    } catch (e) { setError(classifyError(e)); setLevels([]) }
+  }, [product.id])
+  useEffect(() => { load() }, [load])
+
+  const rows = useMemo(() => {
+    const now = new Date()
+    return (levels ?? [])
+      .filter(l => l.batchId && (l.availableQuantity ?? 0) > 0)
+      .map(l => ({ level: l, state: batchState(l, { now, tiers }) }))
+      .sort((a, b) => String(a.level.expiryDate ?? '9999').localeCompare(String(b.level.expiryDate ?? '9999')))
+  }, [levels, tiers])
+  const withoutLot = (levels ?? []).filter(l => !l.batchId).reduce((n, l) => n + (l.availableQuantity ?? 0), 0)
+
+  if (derog) {
+    const inWh = rows.filter(r => r.level.warehouseId === derog.level.warehouseId)
+    const noLotSellable = (levels ?? []).filter(l => !l.batchId && l.warehouseId === derog.level.warehouseId)
+    return React.createElement(ExpiredIssueModal, {
+      app, api, product, level: derog.level,
+      sellable: inWh.reduce((n, r) => n + sellableOf(r.level), 0) + noLotSellable.reduce((n, l) => n + sellableOf(l), 0),
+      expired: inWh.filter(r => r.state?.kind === 'expired').reduce((n, r) => n + (r.level.availableQuantity ?? 0), 0),
+      onClose: () => setDerog(null),
+      onDone: () => { setDerog(null); load(); onChanged?.() },
+    })
+  }
+
+  const th = { ...S.th, padding: '8px 10px' }
+  const td = { ...S.td, padding: '8px 10px', fontSize: 13 }
+  return React.createElement(ModalShell, { wide: true, onClose },
+    React.createElement(ModalHeader, { title: 'Lots et péremption', subtitle: product.name, onClose }),
+    React.createElement('div', { style: { padding: '16px 24px 24px' } },
+      levels === null && Spinner(),
+      error && React.createElement(ScreenState, { failure: error, onRetry: load }),
+      levels !== null && !error && rows.length === 0 && React.createElement(EmptyState, {
+        icon: Icon.package, title: 'Aucun lot en stock',
+        hint: product.isLotTracked ? 'Les lots apparaissent ici après une réception avec un numéro de lot.' : 'Ce produit n’a pas de stock par lot.',
+      }),
+      rows.length > 0 && React.createElement('div', { style: { overflowX: 'auto' } },
+        React.createElement('table', { style: S.table },
+          React.createElement('caption', { style: { position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)' } }, `Lots de ${product.name}`),
+          React.createElement('thead', null, React.createElement('tr', null,
+            ['Lot', 'Entrepôt', 'Quantité', 'Vendable', 'Péremption', 'État', ''].map((h, i) =>
+              React.createElement('th', { key: i, scope: 'col', style: th }, h)))),
+          React.createElement('tbody', null, rows.map(({ level: l, state }) =>
+            React.createElement('tr', { key: l.id ?? `${l.batchId}-${l.warehouseId}-${l.locationId ?? ''}` },
+              React.createElement('td', { style: { ...td, fontFamily: 'monospace' }, title: l.batchId }, l.batchNumber ?? shortId(l.batchId)),
+              React.createElement('td', { style: td }, l.warehouseName ?? l.warehouseId),
+              React.createElement('td', { style: { ...td, fontFamily: 'monospace' } }, fmtQty(l.availableQuantity)),
+              React.createElement('td', { style: { ...td, fontFamily: 'monospace', fontWeight: 600 } }, fmtQty(sellableOf(l))),
+              React.createElement('td', { style: td }, formatDay(l.expiryDate)),
+              React.createElement('td', { style: td }, state?.label
+                ? React.createElement(LotBadge, { state })
+                : React.createElement('span', { style: { color: 'var(--color-text-tertiary)' } }, state ? 'Valide' : '—')),
+              React.createElement('td', { style: { ...td, textAlign: 'right' } },
+                mayDerogate && state?.kind === 'expired' && React.createElement('button', {
+                  type: 'button', style: { ...S.btnSecondary, padding: '6px 10px', fontSize: 11 },
+                  'aria-label': `Sortir le lot périmé ${l.batchNumber ?? shortId(l.batchId)}`,
+                  onClick: () => setDerog({ level: l }),
+                }, 'Sortir un lot périmé')),
+            )))),
+      ),
+      withoutLot > 0 && rows.length > 0 && React.createElement('div', { style: { fontSize: 12, color: 'var(--color-text-tertiary)', marginTop: 10 } },
+        `${fmtQty(withoutLot)} en stock sans lot, non listé(s) ici.`),
+    ),
+  )
+}
+
+function ExpiredIssueModal({ app, api, product, level, sellable, expired, onClose, onDone }) {
+  const [quantity, setQuantity] = useState(level.availableQuantity ?? 1)
+  const [reason, setReason] = useState('')
+  const [error, setError] = useState(null)
+  const [confirming, setConfirming] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const plan = issuePlan({ sellable, expired, quantity })
+  const lotName = level.batchNumber ?? shortId(level.batchId)
+
+  const submit = (e) => {
+    e.preventDefault()
+    const problem = validateExpiredIssue({ reason, quantity }) ?? expiredIssueProblem(plan, sellable)
+    if (problem) { setError(problem); return }
+    setError(null); setConfirming(true)
+  }
+  const run = async () => {
+    setSaving(true)
+    try {
+      await api.movements.issue(buildExpiredIssue({ productId: product.id, warehouseId: level.warehouseId, quantity, reason }))
+      app.notify('Sortie enregistrée avec dérogation', 'success')
+      onDone()
+      return
+    } catch (e) { setError(formatStockError(e, { fallback: "Erreur lors de l'enregistrement" })) }
+    setSaving(false); setConfirming(false)
+  }
+
+  return React.createElement(ModalShell, { onClose },
+    React.createElement(ModalHeader, { title: 'Sortir un lot périmé', subtitle: `${product.name} · lot ${lotName}`, onClose }),
+    React.createElement('form', { onSubmit: submit, style: { padding: '16px 24px 24px' }, noValidate: true },
+      React.createElement('div', { style: { padding: '10px 14px', borderRadius: 12, fontSize: 12, lineHeight: 1.45,
+        background: 'var(--color-warning-muted)', color: 'var(--color-warning-text)', border: '1px solid var(--color-warning-border)' } },
+        'Dérogation : ce lot est périmé et ne peut plus être vendu. Cette sortie est réservée aux cas autorisés (destruction, retour fournisseur…) et reste tracée avec votre motif.'),
+      React.createElement('label', { htmlFor: 'xs-exp-qty', style: { ...S.label, marginTop: 14 } }, 'Quantité à sortir *'),
+      React.createElement('input', { id: 'xs-exp-qty', style: S.input, type: 'number', min: 0.01, step: 0.01, value: quantity,
+        onChange: e => setQuantity(+e.target.value), 'aria-describedby': 'xs-exp-plan' }),
+      React.createElement('div', { id: 'xs-exp-plan', style: { fontSize: 12, marginTop: 6,
+        color: plan.fromValid > 0 ? 'var(--color-warning-text)' : 'var(--color-text-secondary)', fontWeight: plan.fromValid > 0 ? 600 : 400 } },
+        plan.fromValid > 0
+          ? `Attention : les lots valides partent d’abord (${fmtQty(sellable)} vendable(s) dans cet entrepôt). Cette sortie prendrait ${fmtQty(plan.fromValid)} en lot(s) valide(s) puis ${fmtQty(plan.fromExpired)} en lot(s) périmé(s).`
+          : `${fmtQty(plan.fromExpired)} seront prélevés dans les lots périmés.`,
+        plan.short > 0 && ` ${fmtQty(plan.short)} dépassent le stock disponible.`),
+      React.createElement('label', { htmlFor: 'xs-exp-reason', style: { ...S.label, marginTop: 14 } }, 'Motif de la dérogation *'),
+      React.createElement('textarea', { id: 'xs-exp-reason', style: { ...S.input, minHeight: 64, resize: 'vertical' }, rows: 2, required: true,
+        maxLength: EXPIRED_REASON_MAX, value: reason, placeholder: 'Ex : destruction du lot après constat, retour fournisseur n° …',
+        onChange: e => setReason(e.target.value), 'aria-invalid': !!error && !reason.trim(), 'aria-describedby': 'xs-exp-reason-count' }),
+      React.createElement('div', { id: 'xs-exp-reason-count', style: { fontSize: 11, color: 'var(--color-text-tertiary)', textAlign: 'right' } }, `${reason.length}/${EXPIRED_REASON_MAX}`),
+      error && React.createElement('div', { role: 'alert', style: { marginTop: 10, fontSize: 13, fontWeight: 600, color: 'var(--color-danger-text)' } }, error),
+      React.createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 20, paddingTop: 16, borderTop: '1px solid var(--color-border)' } },
+        React.createElement('button', { type: 'button', style: S.btnSecondary, onClick: onClose }, 'Annuler'),
+        React.createElement('button', { type: 'submit', style: { ...S.btnDanger, opacity: saving ? 0.6 : 1 }, disabled: saving }, 'Sortir le lot périmé')),
+    ),
+    confirming && React.createElement(ConfirmDialog, {
+      title: 'Confirmer la sortie d’un lot périmé ?',
+      message: `${fmtQty(quantity)} × « ${product.name} » seront sortis du stock${plan.fromValid > 0 ? ` (dont ${fmtQty(plan.fromValid)} en lot(s) valide(s))` : ''} avec la dérogation « ${reason.trim()} ». Cette action est tracée et ne s’annule pas.`,
+      confirmLabel: saving ? 'Enregistrement…' : 'Confirmer la sortie', danger: true,
+      onConfirm: saving ? undefined : run, onCancel: () => setConfirming(false),
     }),
   )
 }
@@ -1857,8 +2070,9 @@ function MovementsTab({ app, api }) {
   const [formOpen, setFormOpen] = useState(false)
   const [formKind, setFormKind] = useState('receive')
   const [saving, setSaving] = useState(false)
+  const [formError, setFormError] = useState(null)
 
-  const openForm = useCallback((kind) => { setFormKind(kind); setFormOpen(true) }, [])
+  const openForm = useCallback((kind) => { setFormKind(kind); setFormError(null); setFormOpen(true) }, [])
 
   const load = useCallback(async (silent) => {
     if (!silent) setLoading(true)
@@ -1878,12 +2092,24 @@ function MovementsTab({ app, api }) {
 
   const handleCreate = useCallback(async (kind, data) => {
     setSaving(true)
+    setFormError(null)
     try {
       await api.movements[kind](data)
       setFormOpen(false)
       await load()
       app.notify('Mouvement enregistré', 'success')
-    } catch (e) { app.notify(e?.message ?? "Erreur lors de l'enregistrement", 'error') }
+    } catch (e) {
+      // Refus lisibles : stock vendable insuffisant (lots périmés), péremption de lot incohérente.
+      const message = formatStockError(e, { fallback: "Erreur lors de l'enregistrement" })
+      const info = insufficientInfo(e)
+      const hint = info && info.expired > 0
+        ? (canUseExpired(app)
+          ? 'Une sortie avec dérogation est possible : Produits, menu du produit, « Lots et péremption ».'
+          : 'Seul un rôle autorisé peut sortir des lots périmés.')
+        : null
+      setFormError({ message, hint })
+      app.notify(message, 'error')
+    }
     setSaving(false)
   }, [load])
 
@@ -1953,12 +2179,12 @@ function MovementsTab({ app, api }) {
       ),
     ),
     formOpen && React.createElement(MovementFormModal, {
-      products, warehouses, saving, initialKind: formKind, onClose: () => setFormOpen(false), onSave: handleCreate,
+      products, warehouses, saving, initialKind: formKind, error: formError, onClose: () => setFormOpen(false), onSave: handleCreate,
     }),
   )
 }
 
-function MovementFormModal({ products, warehouses, initialKind, onClose, onSave, saving }) {
+function MovementFormModal({ products, warehouses, initialKind, onClose, onSave, saving, error }) {
   const [kind, setKind] = useState(initialKind ?? 'receive')
   const [productId, setProductId] = useState('')
   const [warehouseId, setWarehouseId] = useState('')
@@ -2052,6 +2278,11 @@ function MovementFormModal({ products, warehouses, initialKind, onClose, onSave,
         React.createElement('label', { style: { ...S.label, marginTop: 12 } }, 'Référence (optionnel)'),
         React.createElement('input', { style: S.input, value: sourceReference, onChange: e => setSourceReference(e.target.value), placeholder: 'Ex : BL fournisseur, n° de commande…' }),
       ),
+
+      error && React.createElement('div', { role: 'alert', style: { marginTop: 14, padding: '10px 14px', borderRadius: 12, fontSize: 13,
+        background: 'var(--color-danger-muted)', color: 'var(--color-danger-text)', border: '1px solid var(--color-danger-border)' } },
+        React.createElement('div', { style: { fontWeight: 600 } }, error.message),
+        error.hint && React.createElement('div', { style: { marginTop: 4, fontSize: 12 } }, error.hint)),
 
       React.createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 20, paddingTop: 16, borderTop: '1px solid var(--color-border)' } },
         React.createElement('button', { type: 'button', style: S.btnSecondary, onClick: onClose }, 'Annuler'),
@@ -3086,6 +3317,27 @@ function SettingsTab({ app, api }) {
     } catch (e) { app.notify('Erreur', 'error') }
   }, [])
 
+  // Paliers d'alerte de péremption (jours avant l'échéance) : champ texte « 90, 30, 7 », validé avant envoi.
+  // Absent des réglages = serveur plus ancien : le bloc n'est pas affiché.
+  const [tiersText, setTiersText] = useState('')
+  const [tiersError, setTiersError] = useState(null)
+  const [savingTiers, setSavingTiers] = useState(false)
+  const locked = settingsLocked(app)
+  const hasTiers = Array.isArray(settings?.expiryAlertTiers)
+  useEffect(() => { if (hasTiers) setTiersText(formatTiers(tiersFromSettings(settings))) }, [settings?.expiryAlertTiers])
+  const saveTiers = useCallback(async (e) => {
+    e.preventDefault()
+    const r = parseTiersInput(tiersText)
+    if (!r.ok) { setTiersError(r.error); return }
+    setTiersError(null); setSavingTiers(true)
+    try {
+      const saved = await api.settings.update({ expiryAlertTiers: r.tiers })
+      setSettings(saved)
+      app.notify('Paliers d’alerte enregistrés', 'success')
+    } catch (err) { setTiersError(formatStockError(err, { fallback: 'Impossible d’enregistrer les paliers.' })) }
+    setSavingTiers(false)
+  }, [tiersText])
+
   const resetAlert = useCallback(async (alertType) => {
     try {
       await api.settings.resetAlert(alertType)
@@ -3137,9 +3389,22 @@ function SettingsTab({ app, api }) {
             onBlur: e => update({ defaultServiceLevel: +e.target.value }) }),
         ),
         React.createElement('div', { style: { marginTop: 12 } },
-          React.createElement('label', { style: S.label }, 'Alerte péremption (jours avant)'),
+          React.createElement('label', { style: S.label }, hasTiers ? 'Liste « bientôt périmés » (jours)' : 'Alerte péremption (jours avant)'),
           React.createElement('input', { style: S.input, type: 'number', min: 0, defaultValue: settings?.expiryWarningDays,
             onBlur: e => update({ expiryWarningDays: +e.target.value }) }),
+        ),
+        hasTiers && React.createElement('form', { onSubmit: saveTiers, noValidate: true, style: { marginTop: 12 } },
+          React.createElement('label', { htmlFor: 'xs-tiers', style: S.label }, 'Paliers d’alerte de péremption (jours avant)'),
+          React.createElement('div', { style: { display: 'flex', gap: 8 } },
+            React.createElement('input', { id: 'xs-tiers', style: S.input, value: tiersText, disabled: locked, inputMode: 'numeric',
+              placeholder: '90, 30, 7', onChange: e => { setTiersText(e.target.value); setTiersError(null) },
+              'aria-invalid': !!tiersError, 'aria-describedby': 'xs-tiers-help' }),
+            React.createElement('button', { type: 'submit', style: { ...S.btnSecondary, opacity: locked || savingTiers ? 0.5 : 1 },
+              disabled: locked || savingTiers }, savingTiers ? 'Enregistrement…' : 'Enregistrer')),
+          React.createElement('div', { id: 'xs-tiers-help', style: { fontSize: 11, color: 'var(--color-text-tertiary)', marginTop: 4 } },
+            locked ? 'Réservé aux rôles qui peuvent modifier les réglages de stock.'
+              : `Une alerte par lot et par palier, de 1 à ${MAX_TIER_DAYS} jours (ex. 90, 30, 7).`),
+          tiersError && React.createElement('div', { role: 'alert', style: { fontSize: 12, fontWeight: 600, color: 'var(--color-danger-text)', marginTop: 4 } }, tiersError),
         ),
       ),
       React.createElement('div', { style: { ...S.card, padding: 24 } },
